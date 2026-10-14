@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/sasf-core",
-    "crates/sasf-doctor",
-    "crates/sasf-tools",
-    "crates/sasf-orchestrator",
-    "crates/sasf-cli",
-    "crates/sasf-web",
+    "crates/malvex-core",
+    "crates/malvex-doctor",
+    "crates/malvex-tools",
+    "crates/malvex-orchestrator",
+    "crates/malvex-cli",
+    "crates/malvex-web",
 ]
 
 [workspace.package]

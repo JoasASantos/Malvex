@@ -51,7 +51,7 @@ else
   git clone --depth 1 "$REPO.git" "$INSTALL_DIR" 2>/dev/null || {
     # fallback: download tarball if git clone fails (private repo, etc.)
     log "git clone failed — trying local build from current directory"
-    if [ -f "Cargo.toml" ] && grep -q "malvex\|sasf" Cargo.toml 2>/dev/null; then
+    if [ -f "Cargo.toml" ] && grep -q "malvex\|malvex" Cargo.toml 2>/dev/null; then
       INSTALL_DIR="$(pwd)"
       warn "using current directory as install source: $INSTALL_DIR"
     else
@@ -85,11 +85,11 @@ for bin in malvex malvex-web; do
   fi
 done
 
-# also symlink from sasf names if they exist
-for bin in sasf sasf-web; do
+# also symlink from malvex names if they exist
+for bin in malvex malvex-web; do
   src="$INSTALL_DIR/target/release/$bin"
   if [ -f "$src" ]; then
-    target_bin=$(echo "$bin" | sed 's/sasf/malvex/')
+    target_bin=$(echo "$bin" | sed 's/malvex/malvex/')
     cp "$src" "$BIN_DIR/$target_bin"
     chmod +x "$BIN_DIR/$target_bin"
     ok "installed $target_bin -> $BIN_DIR/$target_bin"
@@ -126,13 +126,51 @@ else
   warn "npm not found — skipping REA install. Install Node.js for full RE capabilities."
 fi
 
-# ── 9. register Malvex as MCP server in Claude Code ───────────────────────
+# ── 9. register Malvex as MCP server in all detected editors ──────────
+log "registering Malvex MCP server in detected editors"
+
+register_json_mcp() {
+  local cfg="$1" editor="$2"
+  local dir; dir="$(dirname "$cfg")"
+  mkdir -p "$dir"
+  if [ -f "$cfg" ] && [ -s "$cfg" ]; then
+    python3 -c "
+import json, os
+cfg = json.load(open('$cfg'))
+cfg.setdefault('mcpServers', {})['malvex'] = {'command': '$BIN_DIR/malvex', 'args': ['serve', '--mcp']}
+json.dump(cfg, open('$cfg', 'w'), indent=2)
+" 2>/dev/null && ok "Malvex MCP registered in $editor" || warn "$editor MCP registration skipped"
+  else
+    printf '{"mcpServers":{"malvex":{"command":"%s","args":["serve","--mcp"]}}}\n' "$BIN_DIR/malvex" > "$cfg"
+    ok "Malvex MCP registered in $editor"
+  fi
+}
+
+# Claude Code
 if have claude; then
-  log "registering Malvex MCP server with Claude Code"
-  claude mcp add malvex -- "$BIN_DIR/malvex" serve --mcp 2>/dev/null && ok "Malvex MCP server registered" || warn "MCP registration skipped"
+  claude mcp add malvex -- "$BIN_DIR/malvex" serve --mcp 2>/dev/null && ok "Malvex MCP registered in Claude Code" || warn "Claude Code MCP skipped"
 else
-  warn "Claude Code CLI not found — install it to use Malvex as MCP server"
-  warn "  curl -fsSL https://claude.ai/install.sh | bash"
+  warn "Claude Code not found — install: curl -fsSL https://claude.ai/install.sh | bash"
+fi
+
+# Windsurf
+if [ -d "$HOME/.codeium/windsurf" ] || have windsurf; then
+  register_json_mcp "$HOME/.codeium/windsurf/mcp_config.json" "Windsurf"
+fi
+
+# Cursor
+if [ -d "$HOME/.cursor" ] || have cursor; then
+  register_json_mcp "$HOME/.cursor/mcp.json" "Cursor"
+fi
+
+# VS Code (Copilot MCP)
+if have code; then
+  register_json_mcp "$HOME/.vscode/mcp.json" "VS Code"
+fi
+
+# OpenCode
+if have opencode; then
+  register_json_mcp "$HOME/.opencode/mcp.json" "OpenCode"
 fi
 
 # ── 10. preflight check ──────────────────────────────────────────────────
@@ -155,6 +193,6 @@ ok "    malvex run <sample.exe> --dry-run    # plan only"
 ok "    malvex tool capa <sample.exe>        # single tool"
 ok "    malvex serve --mcp                   # MCP server mode"
 ok ""
-ok "  In Claude Code:"
-ok "    \"Use Malvex to analyze malware.exe\"  # uses MCP tools"
+ok "  In Claude Code / Windsurf / Cursor / VS Code / OpenCode:"
+ok "    \"Use Malvex to analyze malware.exe\"  # uses 31 MCP tools"
 ok "════════════════════════════════════════════════════════════"

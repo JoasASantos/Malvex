@@ -382,11 +382,11 @@ Similarity is not attribution. ATT&CK mappings, family matches, and lineage are 
 
 ```
 crates/
-  sasf-core           shared types (Target, Finding, Severity, Tool)
-  sasf-doctor         tool detection + install + MCP registry
-  sasf-orchestrator   pipeline orchestration, execution, parsing, PoC validation
-  sasf-cli            `malvex` binary
-  sasf-web            web UI (axum upload + session review)
+  malvex-core           shared types (Target, Finding, Severity, Tool)
+  malvex-doctor         tool detection + install + MCP registry
+  malvex-orchestrator   pipeline orchestration, execution, parsing, PoC validation
+  malvex-cli            `malvex` binary
+  malvex-web            web UI (axum upload + session review)
 agents/               15 agent system prompts (markdown)
 skills/               61 SKILL.md procedures aligned to the malware analysis matrix
 vulns/
@@ -441,7 +441,7 @@ Static reverse engineering is host-independent — IDA (via idalib MCP), Ghidra,
 
 ```bash
 cargo build --release
-cargo test --release -p sasf-orchestrator
+cargo test --release -p malvex-orchestrator
 ./target/release/malvex doctor
 ```
 

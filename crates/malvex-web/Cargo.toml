@@ -1,0 +1,23 @@
+[package]
+name = "malvex-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "malvex-web"
+path = "src/main.rs"
+
+[dependencies]
+malvex-core = { path = "../malvex-core" }
+malvex-orchestrator = { path = "../malvex-orchestrator" }
+malvex-doctor = { path = "../malvex-doctor" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "fs", "time"] }
+base64 = "0.22"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+walkdir = "2"
+regex = "1"

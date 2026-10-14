@@ -8,12 +8,12 @@ verified, evidence-backed investigation of malware behavior, capabilities, and l
 ```mermaid
 graph TD
     subgraph "Entry Points"
-        CLI["sasf-cli<br/>malvex binary<br/>12 subcommands"]
-        WEB["sasf-web<br/>axum upload UI<br/>drag binary → identify → run"]
+        CLI["malvex-cli<br/>malvex binary<br/>12 subcommands"]
+        WEB["malvex-web<br/>axum upload UI<br/>drag binary → identify → run"]
         MCP_SERVER["MCP server<br/>malvex serve --mcp<br/>JSON-RPC 2.0 over stdio<br/>8 tools"]
     end
 
-    subgraph "Orchestrator (sasf-orchestrator)"
+    subgraph "Orchestrator (malvex-orchestrator)"
         CONFIG["Config<br/>model, runtime, parallel,<br/>stages, approval mode"]
         PLAN["plan()<br/>stage graph + agent sharding"]
         EXEC["exec.rs<br/>run_real, resume,<br/>per-agent output capture"]
@@ -48,7 +48,7 @@ graph TD
         SANDBOX["sandbox-analysis<br/>detonation, behavioral traces,<br/>evasion detection"]
     end
 
-    subgraph "Tool Layer (sasf-doctor)"
+    subgraph "Tool Layer (malvex-doctor)"
         REGISTRY["registry.rs<br/>216 tools with probes,<br/>install commands, MCP mapping"]
         MCP_SETUP["mcp.rs<br/>18 MCP servers<br/>auto-register with claude"]
         SCAN["scan()<br/>probe PATH + python imports<br/>+ configured MCPs"]

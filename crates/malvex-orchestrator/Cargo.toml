@@ -1,0 +1,13 @@
+[package]
+name = "malvex-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+malvex-core = { path = "../malvex-core" }
+anyhow.workspace = true
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true

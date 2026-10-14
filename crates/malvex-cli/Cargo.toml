@@ -1,0 +1,19 @@
+[package]
+name = "malvex-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "malvex"
+path = "src/main.rs"
+
+[dependencies]
+malvex-core = { path = "../malvex-core" }
+malvex-doctor = { path = "../malvex-doctor" }
+malvex-tools = { path = "../malvex-tools" }
+malvex-orchestrator = { path = "../malvex-orchestrator" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
