@@ -602,6 +602,8 @@ Example prompts:
       </select>
       <select class="cbtn" name="models" multiple title="Models (first=primary, rest=fallback)" style="min-width:140px;height:auto">
         <option value="claude-opus-5-5" selected>Opus 5.5</option>
+        <option value="claude-opus-4-7">Opus 4.7</option>
+        <option value="claude-opus-4-6">Opus 4.6</option>
         <option value="claude-sonnet-5-5">Sonnet 5.5</option>
         <option value="claude-fable-5-1">Fable 5.1</option>
         <option value="claude-haiku-4-5">Haiku 4.5</option>
@@ -785,6 +787,8 @@ footer{padding:1.25rem;text-align:center;color:#a5a5a5;font-size:.8rem}
     <label class=parallel-row>Modelo
       <select name=models multiple style="height:80px">
         <option value=claude-opus-5-5 selected>Opus 5.5</option>
+        <option value=claude-opus-4-7>Opus 4.7</option>
+        <option value=claude-opus-4-6>Opus 4.6</option>
         <option value=claude-sonnet-5-5>Sonnet 5.5</option>
         <option value=claude-fable-5-1>Fable 5.1</option>
         <option value=claude-haiku-4-5>Haiku 4.5</option>
