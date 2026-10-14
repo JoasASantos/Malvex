@@ -381,11 +381,112 @@ async fn schedule_page(State(st): State<Arc<AppState>>) -> Html<String> {
 }
 
 async fn settings_page() -> Html<String> {
-    let body = r#"<h1>Settings</h1><p class=dim>Configure the local Malvex execution boundary. Credentials remain managed by the provider CLI or environment.</p>
-    <div class=card><h3>AI runtimes</h3><p><b>Claude subscription</b> · active local CLI session</p><p><b>Codex subscription</b> · active local CLI session</p><p><b>Custom / API gateway</b> · configured through <code>MALVEX_CUSTOM_CMD</code></p></div>
-    <div class=card><h3>Model catalog</h3><p>Primary and fallback models are selected per investigation. Custom model IDs are accepted for OpenAI-compatible gateways.</p><p class=dim>Claude Opus 5 · Opus 4.8 · Opus 4.6 · Sonnet 5 · Sonnet 4.6<br>GPT-5.6 Sol · GPT-5.6 Terra · GPT-5.6 Luna · GPT-5.1 Codex Max · GPT-5 Codex</p></div>
-    <div class=card><h3>Approval policy</h3><p>Auto mode · Approve risky actions · Human in the loop</p><p class=dim>Terminal commands and agent actions must remain auditable. Destructive commands are blocked by the local REPL policy.</p></div>
-    <div class=card><h3>Workspace</h3><p><code>/opt/MalvexAI</code> · sessions, reports, schedules, skills and MCP configuration.</p><a class='btn' href='/'>Back to Investigator</a> <a class='btn ghost' href='/api/doctor'>View tool health JSON</a></div>"#;
+    let body = r##"<h1>Settings</h1><p class=dim>Configure the local Malvex execution boundary.</p>
+
+    <div class=card><h3>Analysis Pipeline</h3>
+    <svg viewBox="0 0 800 340" style="width:100%;max-width:800px;font-family:ui-monospace,monospace" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#ff3f8e"/><stop offset="100%" stop-color="#7c3aed"/></linearGradient>
+        <linearGradient id="g2" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#82a9ff"/><stop offset="100%" stop-color="#65d4df"/></linearGradient>
+      </defs>
+      <style>text{fill:#e7ebf3;font-size:11px}.box{fill:#151a24;stroke:#1e2a3a;stroke-width:1.5;rx:8}.label{font-size:13px;font-weight:700;fill:#82a9ff}.sub{fill:#6b7a90;font-size:10px}.arrow{stroke:#65d4df;stroke-width:2;fill:none;marker-end:url(#ah)}
+      <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10" fill="#65d4df"/></marker>
+      </style>
+      <rect class="box" x="10" y="20" width="120" height="90"/>
+      <text class="label" x="30" y="42">TRIAGE</text>
+      <text class="sub" x="20" y="58">hashes, type, packer</text>
+      <text class="sub" x="20" y="70">entropy, strings</text>
+      <text class="sub" x="20" y="82">IOC surface, exiftool</text>
+      <text class="sub" x="20" y="94">pdf-parser, oleid</text>
+
+      <path class="arrow" d="M130,65 L155,65"/>
+
+      <rect class="box" x="160" y="20" width="140" height="90"/>
+      <text class="label" x="180" y="42">STATIC</text>
+      <text class="sub" x="170" y="58">disassembly, decompile</text>
+      <text class="sub" x="170" y="70">capa, radare2, ghidra</text>
+      <text class="sub" x="170" y="82">olevba, macro analysis</text>
+      <text class="sub" x="170" y="94">imports, exports, CFG</text>
+
+      <path class="arrow" d="M300,65 L325,65"/>
+
+      <rect class="box" x="330" y="20" width="140" height="90"/>
+      <text class="label" x="350" y="42">DYNAMIC</text>
+      <text class="sub" x="340" y="58">sandbox execution</text>
+      <text class="sub" x="340" y="70">memory analysis</text>
+      <text class="sub" x="340" y="82">API tracing, frida</text>
+      <text class="sub" x="340" y="94">headless browser</text>
+
+      <path class="arrow" d="M400,110 L400,140"/>
+
+      <rect class="box" x="10" y="140" width="140" height="80"/>
+      <text class="label" x="30" y="162">NETWORK</text>
+      <text class="sub" x="20" y="178">tshark, tcpdump</text>
+      <text class="sub" x="20" y="190">mitmproxy, zeek</text>
+      <text class="sub" x="20" y="202">DNS/HTTP/TLS capture</text>
+
+      <path class="arrow" d="M150,180 L175,180"/>
+
+      <rect class="box" x="180" y="140" width="140" height="80"/>
+      <text class="label" x="200" y="162">INTELLIGENCE</text>
+      <text class="sub" x="190" y="178">YARA scanning</text>
+      <text class="sub" x="190" y="190">MITRE ATT&amp;CK map</text>
+      <text class="sub" x="190" y="202">threat intel, OSINT</text>
+
+      <path class="arrow" d="M320,180 L345,180"/>
+
+      <rect class="box" x="350" y="140" width="140" height="80"/>
+      <text class="label" x="370" y="162">VALIDATE</text>
+      <text class="sub" x="360" y="178">evidence gate</text>
+      <text class="sub" x="360" y="190">PoC compilation</text>
+      <text class="sub" x="360" y="202">confidence scoring</text>
+
+      <path class="arrow" d="M420,220 L420,250"/>
+      <rect x="370" y="255" width="100" height="30" rx="15" fill="url(#g1)"/>
+      <text x="387" y="275" style="fill:#fff;font-weight:700;font-size:12px">REPORT</text>
+
+      <rect class="box" x="530" y="20" width="250" height="270"/>
+      <text class="label" x="550" y="42">TOOLS (22)</text>
+      <text class="sub" x="540" y="58">RE: ghidra, ida, radare2, capa, binwalk</text>
+      <text class="sub" x="540" y="72">Strings: strings, exiftool, hashing</text>
+      <text class="sub" x="540" y="86">Binary: pe, elf, macho</text>
+      <text class="sub" x="540" y="100">Document: pdf-parser, pdfid, olevba</text>
+      <text class="sub" x="540" y="114">Document: oleid, rtfobj</text>
+      <text class="sub" x="540" y="128">Dynamic: frida, sandbox, volatility</text>
+      <text class="sub" x="540" y="142">Network: tshark</text>
+      <text class="sub" x="540" y="156">Detection: yara</text>
+      <text class="sub" x="540" y="170">Intel: osint</text>
+      <text class="sub" x="540" y="194">HEADLESS CAPABILITIES</text>
+      <text class="sub" x="540" y="208">playwright: browser automation</text>
+      <text class="sub" x="540" y="222">MCP servers: radare2, re-mcp,</text>
+      <text class="sub" x="540" y="236">  ida-pro, ghidra, yaraflux,</text>
+      <text class="sub" x="540" y="250">  muster, cutter, frida, x64dbg</text>
+      <text class="sub" x="540" y="274">61 skills · 15 agents · 5 runtimes</text>
+    </svg>
+    </div>
+
+    <div class=card><h3>AI Runtimes</h3>
+    <p><b>Claude</b> · subscription via CLI (<code>claude</code>)</p>
+    <p><b>Codex</b> · subscription via CLI (<code>codex</code>)</p>
+    <p><b>Hermes</b> · local orchestration runtime</p>
+    <p><b>Ollama</b> · local models (<code>ollama serve</code>)</p>
+    <p><b>Custom</b> · API gateway via <code>MALVEX_CUSTOM_CMD</code></p></div>
+
+    <div class=card><h3>Model Catalog</h3>
+    <p class=dim>Claude Opus 5.5 · Opus 4.7 · Opus 4.6 · Sonnet 5.5 · Fable 5.1 · Haiku 4.5<br>GPT-5 · Custom model ID</p></div>
+
+    <div class=card><h3>Headless &amp; MCP</h3>
+    <p>Malvex exposes 31 tools via MCP (<code>malvex serve --mcp</code>). Headless analysis runs all tools without UI.</p>
+    <p class=dim>Claude Code · Windsurf · Cursor · VS Code · OpenCode</p>
+    <p><code>malvex run sample.exe</code> — full headless pipeline</p>
+    <p><code>malvex run sample.pdf --dry-run</code> — plan only</p>
+    <p><code>malvex tool olevba macro.docm</code> — single tool</p></div>
+
+    <div class=card><h3>Approval Policy</h3><p>Auto mode · Approve risky actions · Human in the loop</p>
+    <p class=dim>Destructive commands blocked by REPL safety policy.</p></div>
+
+    <div class=card><h3>Workspace</h3><p><code>/opt/MalvexAI</code></p>
+    <a class='btn' href='/'>Investigator</a> <a class='btn ghost' href='/api/doctor'>Tool health</a></div>"##;
     layout("settings", "/settings", body)
 }
 
@@ -575,15 +676,27 @@ tr:hover td{background:var(--panel2)}
 <section class="repl-side">
   <div class="repl-header"><span class="live"></span> Investigation REPL</div>
   <div class="thread" id="thread">
-    <div class="msg"><div class="who malvex">malvex</div><div class="body">Ready. Drop a binary on the left panel or type a prompt below.
+    <div class="msg"><div class="who malvex">malvex</div><div class="body">Ready. Drop a file on the left panel or type a prompt below.
 
-Commands: <code>!cmd</code> for terminal, <code>/doctor</code> for tool health, <code>/clear</code> to reset.
+Commands: <code>!cmd</code> terminal, <code>/doctor</code> tool health, <code>/clear</code> reset.
 
-Example prompts:
-  <code>Analyze malware.exe for C2 infrastructure</code>
-  <code>Decompile the main function and explain it</code>
-  <code>Scan with YARA and extract IOCs</code>
-  <code>What persistence mechanisms does this use?</code></div></div>
+Binary analysis:
+  <code>Analyze malware.exe — full triage, static RE, IOCs</code>
+  <code>Decompile main and explain the C2 protocol</code>
+  <code>List imports and flag suspicious API calls</code>
+  <code>What persistence mechanisms does this use?</code>
+  <code>Scan with YARA and extract all IOCs</code>
+
+Document analysis:
+  <code>Extract and analyze VBA macros from invoice.docm</code>
+  <code>Parse this PDF for embedded JavaScript or /Launch</code>
+  <code>Check RTF for OLE objects and shellcode</code>
+
+Headless (via Claude Code / OpenCode MCP):
+  <code>Use Malvex to analyze suspicious.exe</code>
+  <code>Use Malvex to extract macros from doc.xlsm</code>
+  <code>Use Malvex to scan sample.bin with YARA</code>
+  <code>Use Malvex to triage and map ATT&amp;CK for dropper.dll</code></div></div>
   </div>
   <form class="composer" id="composer" action="/upload" method="post" enctype="multipart/form-data">
     <input class="hidden" id="binary" type="file" name="binary" accept="*/*">

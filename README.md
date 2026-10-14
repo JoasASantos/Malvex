@@ -87,38 +87,21 @@ Runtime profiles are documented in [`config/runtime-profiles.yaml`](config/runti
 ## Analysis pipeline
 
 ```
- sample path
-       │
-       ▼
- ┌───────────┐   ┌──────────────────────────┐   ┌──────────────────────┐
- │  TRIAGE    │──▶│  STATIC                  │──▶│  DYNAMIC             │
- │ hashes,    │   │  static-core ∥            │   │  dynamic-analysis ∥   │
- │ type,      │   │  decompilation ∥          │   │  memory-analysis ∥    │
- │ packer,    │   │  deobfuscation ∥          │   │                      │
- │ entropy,   │   │                           │   │  (host must match    │
- │ strings,   │   │                           │   │   target platform    │
- │ IOC surface│   │                           │   │   for runtime proof) │
- └───────────┘   └──────────────────────────┘   └──────────┬───────────┘
-                                                            ▼
-                  ┌──────────────────────────┐   ┌──────────────────────┐
-                  │  NETWORK                 │   │  INTELLIGENCE        │
-                  │  network-analysis ∥       │   │  detection-eng ∥      │
-                  │  tshark / tcpdump /      │──▶│  threat-intel ∥       │
-                  │  mitmproxy / zeek        │   │                      │
-                  └──────────────────────────┘   └──────────┬───────────┘
-                                                            ▼
-                  ┌──────────────────────────┐
-                  │  VALIDATE                │
-                  │  rejects unsupported     │
-                  │  conclusions; forces     │
-                  │  evidence/confidence     │
-                  └──────────────────────────┘
-                             │
-                             ▼
-                    session artifacts
+sample ──▶ TRIAGE ──▶ STATIC ──▶ DYNAMIC ──▶ NETWORK ──▶ INTELLIGENCE ──▶ VALIDATE ──▶ report
 ```
 
-Six pipeline stages, each spawning one or more agents in parallel. Agents share state through MCP (muster blackboard + claude-mem). Findings flow through a validator gate — no finding reaches `confirmed` without independent reproduction.
+| Stage | Agents | Tools |
+|---|---|---|
+| **Triage** | `triage` | hashing, strings, exiftool, pdfid, oleid, file type, packer ID, entropy |
+| **Static** | `static-core`, `decompilation`, `deobfuscation` | ghidra, ida, radare2, capa, olevba, pdf-parser, binwalk |
+| **Dynamic** | `dynamic-analysis`, `memory-analysis` | frida, sandbox, volatility, headless browser |
+| **Network** | `network-analysis` | tshark, tcpdump, mitmproxy, zeek |
+| **Intelligence** | `detection-engineering`, `threat-intel` | yara, sigma, OSINT, ATT&CK mapping |
+| **Validate** | `validator` | evidence gate — rejects unsupported conclusions |
+
+Six stages, each spawning parallel agents. Agents share state through MCP (muster blackboard + claude-mem). No finding reaches `confirmed` without independent evidence reproduction.
+
+The full pipeline SVG is available in the web UI at `/settings`.
 
 ## Tooling matrix
 
@@ -310,6 +293,57 @@ malvex serve --transport stdio
 | **Network** | `malvex_pcap_analyze` | PCAP analysis: protocols, DNS, HTTP, TLS |
 
 Each tool automatically selects the best available backend (e.g. `malvex_disasm` tries radare2, then Ghidra, then IDA) and returns structured output. Tools that require external backends report exactly what to install if missing.
+
+## Example prompts (Claude Code / OpenCode / Windsurf / Cursor)
+
+After `malvex setup`, use these prompts directly in your editor. Malvex runs headless via MCP.
+
+### Binary analysis
+
+```
+Use Malvex to analyze suspicious.exe — full triage, static RE, and IOC extraction
+Use Malvex to decompile the main function of dropper.dll and explain the C2 protocol
+Use Malvex to list imports of ransomware.exe and flag crypto API usage
+Use Malvex to scan payload.bin with YARA and map findings to MITRE ATT&CK
+Use Malvex to triage packed.exe — detect packer, entropy, and embedded strings
+Use Malvex to extract IOCs from cobalt_beacon.bin — IPs, domains, URLs, hashes
+```
+
+### Document analysis
+
+```
+Use Malvex to extract and analyze VBA macros from invoice.docm
+Use Malvex to parse malicious.pdf for embedded JavaScript, /Launch, and /OpenAction
+Use Malvex to check report.rtf for embedded OLE objects and shellcode
+Use Malvex to triage spreadsheet.xlsm — macros, auto-open, suspicious strings
+Use Malvex to analyze phishing.docx for template injection and remote URLs
+```
+
+### Memory and network
+
+```
+Use Malvex to analyze memory.dmp — injections, hollowed processes, decrypted config
+Use Malvex to analyze traffic.pcap — C2 beaconing, DNS tunneling, exfiltration
+Use Malvex to scan memory dump for RWX regions and reflective DLL loading
+```
+
+### Pipeline and orchestration
+
+```
+Use Malvex to run a full analysis pipeline on sample.exe with 3 parallel agents
+Use Malvex to plan (dry-run) analysis of installer.msi — show what it would do
+Use Malvex to check tool health — what analysis tools and MCPs are available
+Use Malvex to list my previous analysis sessions
+```
+
+### Single tool invocation
+
+```
+Use Malvex to hash sample.exe — MD5, SHA1, SHA256, ssdeep, imphash
+Use Malvex to run capa on loader.dll and show ATT&CK capabilities
+Use Malvex to disassemble function at 0x401000 in backdoor.exe
+Use Malvex to extract strings from firmware.bin — URLs, IPs, paths, registry keys
+```
 
 ## Agents
 
