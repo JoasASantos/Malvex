@@ -1,12 +1,15 @@
 pub mod binwalk;
 pub mod capa;
 pub mod elf;
+pub mod exiftool;
 pub mod frida;
 pub mod ghidra;
 pub mod hashing;
 pub mod ida;
 pub mod macho;
+pub mod oletools;
 pub mod osint;
+pub mod pdf;
 pub mod pe;
 pub mod radare2;
 pub mod sandbox;
@@ -120,6 +123,12 @@ pub fn all_runners() -> Vec<Box<dyn ToolRunner>> {
         Box::new(hashing::Hashing),
         Box::new(sandbox::Sandbox),
         Box::new(osint::Osint),
+        Box::new(pdf::PdfParser),
+        Box::new(pdf::PdfId),
+        Box::new(oletools::Olevba),
+        Box::new(oletools::Oleid),
+        Box::new(oletools::Rtfobj),
+        Box::new(exiftool::ExifTool),
     ]
 }
 

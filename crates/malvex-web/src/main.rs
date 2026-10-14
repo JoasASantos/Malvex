@@ -549,10 +549,11 @@ tr:hover td{background:var(--panel2)}
     <div id="tab-overview">
       <div class="empty-state" id="upload-area">
         <label class="upload-zone" for="binary">
-          <h2>Drop a binary to begin</h2>
+          <h2>Drop a file to begin</h2>
           <p>PE · ELF · Mach-O · APK · script · installer · firmware</p>
+          <p>PDF · DOC/DOCX · XLS/XLSX · PPT/PPTX · RTF · HWP · OLE · OneNote</p>
           <p style="margin-top:12px;color:var(--cyan)">or type a prompt in the REPL →</p>
-          <input class="hidden" id="binary" type="file" name="binary">
+          <input class="hidden" id="binary" type="file" name="binary" accept="*/*">
         </label>
       </div>
       <div id="binary-overview" class="hidden">
@@ -720,15 +721,15 @@ footer{padding:1.25rem;text-align:center;color:#a5a5a5;font-size:.8rem}
 <header><a href="/sessions">sessions</a></header>
 <main>
   <h1 class=wordmark>Malvex<span class=dot></span></h1>
-  <p class=tag>Envie uma amostra PE / ELF / Mach-O / script / installer — a plataforma faz triagem,
-  RE, análise dinâmica, inteligência e validação orientadas por evidência.</p>
+  <p class=tag>Envie uma amostra PE / ELF / Mach-O / script / installer / PDF / DOC / XLS / RTF — a plataforma faz triagem,
+  RE, análise dinâmica, macro/VBA, inteligência e validação orientadas por evidência.</p>
   <form class=card action="/upload" method="post" enctype="multipart/form-data" id=f>
     <label class=drop id=drop for=file>
       <span class=icon>⇪</span>
       <span id=label>arraste o binário aqui, ou clique pra escolher</span>
       <span class=fname id=fname></span>
-      <span class=hint>.exe · .dll · .sys · .elf · .so · .dylib · .app · script · installer</span>
-      <input id=file type=file name=binary required/>
+      <span class=hint>.exe · .dll · .sys · .elf · .so · .dylib · .app · script · installer · .pdf · .doc(x) · .xls(x) · .ppt(x) · .rtf · .ole · .onenote</span>
+      <input id=file type=file name=binary required accept="*/*"/>
     </label>
     <label class=parallel-row for=parallel>
       Agentes paralelos por estágio
