@@ -435,51 +435,221 @@ async fn index() -> Html<String> {
     Html(REPL_PAGE.to_string())
 }
 
-// Malvex investigator workspace. The REPL is intentionally the primary surface: every
-// analysis request is a prompt plus an optional local artifact, and the existing multipart
-// pipeline endpoint remains the execution boundary.
+// Debugger + REPL layout inspired by REA: left panel shows binary info (sections, imports,
+// strings, findings, IOCs), right panel is a REPL for extending analysis with prompts.
 const REPL_PAGE: &str = r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Malvex · Investigator</title>
 <style>
-:root{--bg:#0b0d12;--panel:#11151d;--panel2:#171c26;--line:#273043;--text:#e7ebf3;--muted:#8791a5;--blue:#82a9ff;--cyan:#65d4df;--green:#65d39a;--amber:#e8bd71;--red:#ed7777}
-*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:14px/1.45 Inter,ui-sans-serif,system-ui,sans-serif}body{display:flex;min-height:100vh}
-.shell{display:grid;grid-template-columns:248px minmax(0,1fr) 290px;width:100vw;min-height:100vh}.side,.right{background:var(--panel);border-color:var(--line)}.side{border-right:1px solid var(--line);padding:18px 14px;display:flex;flex-direction:column}.right{border-left:1px solid var(--line);padding:18px 16px}.brand{font-size:18px;font-weight:750;letter-spacing:-.03em;display:flex;align-items:center;gap:9px;margin:3px 8px 28px}.mark{width:20px;height:20px;border:2px solid var(--blue);border-radius:5px;transform:rotate(45deg);position:relative}.mark:after{content:"";position:absolute;background:var(--bg);width:8px;height:8px;left:4px;top:4px}.new{display:block;text-decoration:none;color:#07101f;background:var(--blue);font-weight:700;padding:10px 12px;border-radius:8px;margin-bottom:22px}.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.12em;margin:15px 8px 8px}.nav a,.session{display:block;color:var(--muted);text-decoration:none;padding:8px 9px;border-radius:6px}.nav a:hover,.session:hover{background:var(--panel2);color:var(--text)}.session{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{margin-top:auto;color:var(--muted);font-size:11px;padding:10px 8px;border-top:1px solid var(--line)}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:6px}
-.main{display:flex;flex-direction:column;min-width:0}.top{height:58px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 24px}.crumb{color:var(--muted);font-size:12px}.crumb b{color:var(--text);font-weight:600}.top a{color:var(--muted);text-decoration:none;font-size:12px}.workspace{width:min(900px,calc(100% - 48px));margin:0 auto;padding:32px 0 22px;display:flex;flex-direction:column;flex:1}.welcome{margin:22px 0 28px}.eyebrow{color:var(--blue);font-size:11px;text-transform:uppercase;letter-spacing:.14em}.welcome h1{font-size:28px;letter-spacing:-.04em;margin:8px 0}.welcome p{color:var(--muted);max-width:680px;margin:0}.thread{flex:1;min-height:210px;border:1px solid var(--line);background:linear-gradient(180deg,#10151e,#0d1118);border-radius:10px;padding:20px;overflow:auto}.empty{text-align:center;color:var(--muted);padding:42px 20px}.empty strong{display:block;color:var(--text);font-size:15px;margin-bottom:7px}.msg{border-bottom:1px solid var(--line);padding:0 0 16px;margin-bottom:16px}.msg .who{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--blue);margin-bottom:6px}.msg p{margin:0;white-space:pre-wrap}.composer{margin-top:14px;border:1px solid #3b4f74;background:#111824;border-radius:10px;padding:12px}.composer:focus-within{border-color:var(--blue);box-shadow:0 0 0 2px #82a9ff22}.composer textarea{display:block;width:100%;min-height:74px;resize:vertical;border:0;outline:0;background:transparent;color:var(--text);font:14px/1.5 inherit}.composer textarea::placeholder{color:#69758a}.composebar{display:flex;align-items:center;gap:8px;border-top:1px solid var(--line);padding-top:10px}.filebtn,.chip,.run{border:1px solid var(--line);background:var(--panel2);color:var(--muted);border-radius:6px;padding:7px 10px;font:inherit;font-size:12px;cursor:pointer}.filebtn:hover,.chip:hover{color:var(--text);border-color:#536887}.run{margin-left:auto;background:var(--blue);border-color:var(--blue);color:#07101f;font-weight:700}.run:disabled{opacity:.45;cursor:not-allowed}.filename{color:var(--cyan);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hint{color:var(--muted);font-size:11px;margin-top:10px}.right h2{font-size:13px;margin:3px 0 17px}.card{border:1px solid var(--line);background:var(--panel2);border-radius:8px;padding:12px;margin-bottom:12px}.card h3{font-size:12px;margin:0 0 9px}.kv{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:11px;padding:4px 0}.kv span:last-child{color:var(--text);text-align:right}.cap{display:inline-block;border:1px solid #34516a;color:var(--cyan);border-radius:4px;padding:3px 5px;font-size:10px;margin:2px}.legend{color:var(--muted);font-size:11px;line-height:1.6}.hidden{display:none}@media(max-width:950px){.shell{grid-template-columns:210px minmax(0,1fr)}.right{display:none}}@media(max-width:620px){.shell{display:block}.side{display:none}.workspace{width:calc(100% - 28px);padding-top:18px}.top{padding:0 14px}}
+:root{--bg:#0a0c10;--panel:#0f1219;--panel2:#151a24;--line:#1e2a3a;--text:#e7ebf3;--muted:#6b7a90;--blue:#82a9ff;--cyan:#65d4df;--green:#3ddc84;--amber:#e8bd71;--red:#ed7777;--pink:#ff3f8e;--violet:#7c3aed;--gold:#ffcc33}
+*{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:#2a3548 transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden}
+.app{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:42px 1fr;height:100vh;width:100vw}
+.topbar{grid-column:1/-1;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 16px;gap:14px}
+.brand{font:700 15px/1 ui-sans-serif,system-ui,sans-serif;color:var(--text);display:flex;align-items:center;gap:6px;letter-spacing:-.02em}
+.brand .dot{width:8px;height:8px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#fff3c4,var(--gold) 60%)}
+.topbar .sep{width:1px;height:20px;background:var(--line)}
+.topbar a{color:var(--muted);text-decoration:none;font:500 12px/1 ui-sans-serif,system-ui,sans-serif}
+.topbar a:hover{color:var(--text)}
+.topbar .file-info{margin-left:auto;color:var(--muted);font-size:11px}
+.debugger{border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.debug-tabs{display:flex;gap:0;border-bottom:1px solid var(--line);background:var(--panel);flex-shrink:0}
+.dtab{padding:8px 14px;font-size:11px;font-weight:600;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;background:none;border-top:0;border-left:0;border-right:0;font-family:inherit;white-space:nowrap}
+.dtab:hover{color:var(--text)}
+.dtab.active{color:var(--cyan);border-bottom-color:var(--cyan)}
+.debug-content{flex:1;overflow:auto;padding:12px 16px}
+.repl-side{display:flex;flex-direction:column;min-width:0;overflow:hidden}
+.repl-header{padding:8px 16px;border-bottom:1px solid var(--line);background:var(--panel);font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.08em;display:flex;align-items:center;gap:8px;flex-shrink:0}
+.repl-header .live{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.thread{flex:1;overflow:auto;padding:14px 16px}
+.msg{margin-bottom:14px}
+.msg .who{font-size:10px;text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px;font-weight:700}
+.msg .who.user{color:var(--blue)}
+.msg .who.malvex{color:var(--green)}
+.msg .who.tool{color:var(--amber)}
+.msg .body{color:var(--text);font-size:13px;line-height:1.55;white-space:pre-wrap;word-break:break-word}
+.msg .body code{background:var(--panel2);padding:1px 5px;border-radius:3px;font-size:12px}
+.composer{border-top:1px solid var(--line);background:var(--panel);padding:10px 14px;flex-shrink:0;display:flex;flex-direction:column;gap:8px}
+.composer textarea{width:100%;min-height:64px;resize:none;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--text);font:14px/1.5 inherit;padding:10px 12px;outline:none}
+.composer textarea:focus{border-color:var(--blue);box-shadow:0 0 0 2px #82a9ff18}
+.composer textarea::placeholder{color:#4a5568}
+.compose-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cbtn{border:1px solid var(--line);background:var(--panel2);color:var(--muted);border-radius:6px;padding:6px 10px;font:inherit;font-size:11px;cursor:pointer}
+.cbtn:hover{color:var(--text);border-color:#536887}
+.cbtn.primary{background:linear-gradient(135deg,var(--pink),var(--violet));border:0;color:#fff;font-weight:700;padding:6px 16px}
+.cbtn.primary:hover{opacity:.9}
+.file-label{color:var(--cyan);font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hidden{display:none}
+/* Debugger content styling */
+.info-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-bottom:16px}
+.info-card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}
+.info-card .label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px}
+.info-card .value{font-size:14px;font-weight:700;color:var(--text)}
+.info-card .value.green{color:var(--green)}
+.info-card .value.amber{color:var(--amber)}
+.info-card .value.red{color:var(--red)}
+.section-title{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:16px 0 8px;font-weight:700;display:flex;align-items:center;gap:8px}
+.section-title:first-child{margin-top:0}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{text-align:left;padding:5px 8px;border-bottom:1px solid #151a24}
+th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.05em;font-weight:600;position:sticky;top:0;background:var(--bg)}
+tr:hover td{background:var(--panel2)}
+.badge{display:inline-block;padding:2px 7px;border-radius:99px;font-size:10px;font-weight:700}
+.b-crit{background:#2a1020;color:#ff6fa8}
+.b-high{background:#2a1e0d;color:var(--gold)}
+.b-med{background:#252010;color:#d0c050}
+.b-low{background:#0d2220;color:#5ed0c0}
+.b-ok{background:#0f3320;color:var(--green)}
+.hex{font-size:12px;line-height:1.7;color:var(--muted)}
+.hex .offset{color:#4a5568}
+.hex .byte{color:var(--text)}
+.hex .ascii{color:var(--cyan);margin-left:12px}
+.ioc-item{display:flex;gap:8px;padding:4px 0;font-size:12px;align-items:baseline}
+.ioc-type{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;width:50px;flex-shrink:0}
+.mitre-tag{display:inline-block;padding:3px 7px;border-radius:4px;font-size:11px;font-weight:600;background:#1a1030;color:var(--violet);border:1px solid #2d1f50;margin:2px}
+.upload-zone{border:2px dashed var(--line);border-radius:12px;padding:40px 20px;text-align:center;cursor:pointer;transition:border-color .2s}
+.upload-zone:hover{border-color:var(--pink)}
+.upload-zone h2{font:700 18px/1.3 ui-sans-serif,system-ui,sans-serif;margin:0 0 6px;color:var(--text)}
+.upload-zone p{color:var(--muted);font-size:12px;margin:4px 0}
+.progress-track{height:4px;background:#1a2030;border-radius:99px;overflow:hidden;margin:6px 0}
+.progress-fill{height:100%;background:linear-gradient(90deg,var(--pink),var(--violet));border-radius:99px;transition:width .5s}
+.stage-bar{display:flex;gap:4px;flex-wrap:wrap;margin:8px 0}
+.stage{padding:3px 8px;border-radius:5px;font-size:11px;font-weight:600;border:1px solid var(--line);color:var(--muted)}
+.stage.done{background:#0f3320;color:var(--green);border-color:#1e5a30}
+.stage.running{background:#2a2010;color:var(--gold);border-color:#4a3a10;animation:pulse 1.6s ease-in-out infinite}
+.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--muted);text-align:center;gap:12px;padding:20px}
+.empty-state h2{font:700 20px/1.3 ui-sans-serif,system-ui,sans-serif;color:var(--text);margin:0}
+.empty-state p{margin:0;max-width:400px;font-size:13px}
+@media(max-width:800px){.app{grid-template-columns:1fr;grid-template-rows:42px 40vh 1fr}.debugger{border-right:0;border-bottom:1px solid var(--line)}}
 </style>
-<style>
-.chip select{background:transparent;border:0;outline:0;color:var(--text);font:inherit;font-size:11px;cursor:pointer}.chip select option{background:#171c26;color:#e7ebf3}.chip select[multiple]{min-width:170px;max-width:230px;height:25px}.addmenu{display:none;position:absolute;left:12px;bottom:58px;width:270px;background:#202631;border:1px solid #3a465b;border-radius:9px;padding:7px;box-shadow:0 18px 45px #0009;z-index:3}.addmenu.open{display:block}.addmenu button,.addmenu a{display:block;width:100%;text-align:left;background:transparent;border:0;color:var(--text);padding:9px;border-radius:6px;font:inherit;font-size:12px;cursor:pointer;text-decoration:none}.addmenu button:hover,.addmenu a:hover{background:#303949}.addmenu small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.tool-results{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.tool-group{border:1px solid var(--line);background:#121923;border-radius:8px;padding:10px}.tool-group h3{font-size:11px;margin:0 0 7px;color:var(--text)}.tool{font:11px/1.5 ui-monospace,monospace;color:var(--muted);padding:2px 0}.tool.ready{color:var(--green)}.tool.missing{color:var(--red)}
-</style>
-<style>
-.composer textarea{font-size:18px!important;line-height:1.6;min-height:110px}.command-palette{display:none;position:absolute;left:12px;right:12px;bottom:58px;background:#202631;border:1px solid #3a465b;border-radius:9px;padding:6px;box-shadow:0 18px 45px #0009;z-index:4}.command-palette.open{display:block}.command-palette button{display:block;width:100%;text-align:left;background:transparent;border:0;color:var(--text);padding:10px;border-radius:6px;font:14px ui-monospace,monospace;cursor:pointer}.command-palette button:hover{background:#303949}.command-palette small{color:var(--muted);font:11px ui-sans-serif}
-.live-analysis{border:1px solid #3b4f74;background:#111824;border-radius:8px;padding:14px;margin-bottom:14px}.live-head{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}.live-head b{color:var(--green)}.live-track{height:7px;background:#252b35;border-radius:99px;overflow:hidden;margin:9px 0}.live-fill{height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));transition:width .5s}.live-stage{color:var(--text);font-weight:650}.live-log{max-height:170px;margin:10px 0 0}
-</style>
-<style>
-/* Malvex responsive shell: stable columns, readable controls, no horizontal overflow. */
-body{overflow-x:hidden}.shell{grid-template-columns:240px minmax(0,1fr) 280px;min-width:0}.side,.right,.main{min-width:0}.side{padding:20px 14px}.brand{margin-bottom:24px}.nav{display:grid;gap:2px}.nav a{font-size:13px}.top{height:56px;padding:0 clamp(14px,3vw,32px)}.workspace{width:min(980px,calc(100% - 40px));padding:28px 0 24px}.welcome h1{font-size:clamp(25px,3vw,36px)}.thread{min-height:280px;padding:clamp(16px,3vw,28px)}.msg{max-width:860px}.msg p,.msg pre{font-size:15px}.msg pre,.log{margin:10px 0 0;white-space:pre-wrap;overflow:auto;background:#0a0e15;border:1px solid var(--line);border-radius:7px;padding:13px;color:#d8e3f5;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}.composer{position:relative;padding:14px}.composebar{flex-wrap:wrap}.chip{min-height:36px;display:inline-flex;align-items:center;gap:5px}.chip select[multiple]{height:76px;min-width:215px;max-width:260px;padding:4px}.run{min-height:36px}.addmenu,.command-palette{bottom:64px;max-width:min(320px,calc(100vw - 32px))}.right{padding:20px 16px;overflow:auto}.card{overflow:hidden}.tool-results{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}.tool{overflow-wrap:anywhere}@media(max-width:1100px){.shell{grid-template-columns:220px minmax(0,1fr)}.right{display:none}}@media(max-width:700px){body{font-size:14px}.shell{display:block}.side{display:block;border-right:0;border-bottom:1px solid var(--line);padding:10px 12px}.brand{margin:0 8px 10px}.new{margin-bottom:10px}.label{margin-top:10px}.nav{display:flex;overflow:auto}.nav a{white-space:nowrap}.status,.side>.label:last-of-type,.side>.session{display:none}.top{height:48px}.workspace{width:calc(100% - 24px);padding:18px 0}.welcome{margin:8px 0 18px}.welcome p{font-size:13px}.thread{min-height:220px}.composer textarea{min-height:130px}.composebar{align-items:stretch}.composebar>*{max-width:100%}.filename{order:2;flex:1;min-width:120px}.run{width:100%;margin-left:0}.chip{flex:1}.chip select[multiple]{width:100%;min-width:0}.addmenu,.command-palette{left:8px;right:8px;bottom:74px;width:auto}}
-</style>
-<div class="shell">
-<aside class="side"><div class="brand"><span class="mark"></span>malvex</div><a class="new" href="/">+ New investigation</a><div class="label">Workspace</div><nav class="nav"><a href="/">⌘ Investigator</a><a href="/sessions">◫ Sessions</a><a href="/store">◇ Connector &amp; Skill Store</a></nav><div class="label">Recent</div><div class="session">No investigation selected</div><div class="status"><span class="dot"></span>local runtime · protected</div></aside>
-<main class="main"><header class="top"><div class="crumb">workspace / <b>investigator</b></div><a href="/sessions">sessions →</a></header><section class="workspace"><div class="welcome"><div class="eyebrow">Malvex · AI reverse-engineering investigator</div><h1>What are we investigating?</h1><p>Ask a question, attach an artifact, and follow hypotheses, evidence, and verification in one flow.</p></div><div class="thread" id="thread"><div class="empty" id="empty"><strong>Start an investigation</strong>Use <code>!</code> for a local terminal command, or add several prompts before running.</div></div><form class="composer" id="composer" action="/upload" method="post" enctype="multipart/form-data"><div class="addmenu" id="addmenu"><button type="button" id="choose">＋ Attach artifact<small>PE, ELF, Mach-O, script, folder archive</small></button><button type="button" id="addprompt">＋ Add another prompt<small>Build a multi-step investigation request</small></button><button type="button" id="health">◉ Check tools and MCPs<small>Run the Malvex doctor health check</small></button><button type="button" id="terminal">$ Terminal command<small>Type !command in the prompt to execute locally</small></button><a href="/store">◇ Open connector &amp; skill store</a></div><textarea id="prompt" name="custom_prompt" placeholder="Ask the investigator anything…"></textarea><div class="composebar"><button class="filebtn" type="button" id="add">＋ Add</button><input class="hidden" id="binary" type="file" name="binary"><span class="filename" id="filename">no artifact attached</span><label class="chip">Runtime <select name="runtime"><option value="claude">Claude subscription</option><option value="codex">Codex subscription</option><option value="custom">Custom / API gateway</option></select></label><label class="chip">Model <select name="model"><option value="claude-opus-4-6">Claude Opus</option><option value="gpt-5">GPT-5 / Codex</option><option value="custom">Custom model</option></select></label><button class="chip" type="submit" name="mode" value="dry">Plan</button><button class="run" type="submit" name="mode" value="real" id="run">Run investigation ↗</button></div><input type="hidden" name="parallel" value="3"><div class="hint">Local-only · evidence gate required · Ctrl/Cmd + Enter to run</div></form></section></main>
-<aside class="right"><h2>Investigation context</h2><div class="card"><h3>Analysis contract</h3><div class="kv"><span>evidence gate</span><span>required</span></div><div class="kv"><span>confidence</span><span>calibrated</span></div><div class="kv"><span>data handling</span><span>local-only</span></div></div><div class="card"><h3>Capabilities</h3><span class="cap">triage</span><span class="cap">static RE</span><span class="cap">dynamic</span><span class="cap">memory</span><span class="cap">network</span><span class="cap">ATT&amp;CK</span><span class="cap">YARA</span><span class="cap">lineage</span></div><div class="card"><h3>Pipeline</h3><div class="legend">1 · triage<br>2 · static analysis<br>3 · dynamic analysis<br>4 · network analysis<br>5 · intelligence<br>6 · validate</div></div></aside>
+<div class="app">
+<header class="topbar">
+  <div class="brand"><span class="dot"></span>malvex</div>
+  <span class="sep"></span>
+  <a href="/sessions">sessions</a>
+  <a href="/store">store</a>
+  <a href="/schedule">schedules</a>
+  <a href="/settings">settings</a>
+  <span class="file-info" id="file-info">no binary loaded</span>
+</header>
+
+<section class="debugger">
+  <div class="debug-tabs">
+    <button class="dtab active" onclick="showDebugTab(this,'tab-overview')">Overview</button>
+    <button class="dtab" onclick="showDebugTab(this,'tab-sections')">Sections</button>
+    <button class="dtab" onclick="showDebugTab(this,'tab-imports')">Imports</button>
+    <button class="dtab" onclick="showDebugTab(this,'tab-strings')">Strings</button>
+    <button class="dtab" onclick="showDebugTab(this,'tab-findings')">Findings</button>
+    <button class="dtab" onclick="showDebugTab(this,'tab-iocs')">IOCs</button>
+    <button class="dtab" onclick="showDebugTab(this,'tab-mitre')">ATT&CK</button>
+    <button class="dtab" onclick="showDebugTab(this,'tab-hex')">Hex</button>
+  </div>
+
+  <div class="debug-content" id="debug-content">
+    <div id="tab-overview">
+      <div class="empty-state" id="upload-area">
+        <label class="upload-zone" for="binary">
+          <h2>Drop a binary to begin</h2>
+          <p>PE · ELF · Mach-O · APK · script · installer · firmware</p>
+          <p style="margin-top:12px;color:var(--cyan)">or type a prompt in the REPL →</p>
+          <input class="hidden" id="binary" type="file" name="binary">
+        </label>
+      </div>
+      <div id="binary-overview" class="hidden">
+        <div class="info-grid" id="info-grid"></div>
+        <div class="section-title">Pipeline</div>
+        <div class="progress-track"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+        <div class="stage-bar" id="stage-bar"></div>
+        <div class="section-title">Session log</div>
+        <pre class="hex" id="session-log" style="max-height:300px;overflow:auto;color:#6b7a90">Waiting for analysis...</pre>
+      </div>
+    </div>
+    <div id="tab-sections" class="hidden"><table><tr><th>Name</th><th>VAddr</th><th>Size</th><th>Entropy</th><th>Flags</th></tr><tr><td colspan="5" style="color:var(--muted);text-align:center;padding:40px">Load a binary to view sections</td></tr></table></div>
+    <div id="tab-imports" class="hidden"><table><tr><th>Library</th><th>Function</th><th>Ordinal</th></tr><tr><td colspan="3" style="color:var(--muted);text-align:center;padding:40px">Load a binary to view imports</td></tr></table></div>
+    <div id="tab-strings" class="hidden"><table><tr><th>Offset</th><th>String</th><th>Type</th></tr><tr><td colspan="3" style="color:var(--muted);text-align:center;padding:40px">Load a binary to view strings</td></tr></table></div>
+    <div id="tab-findings" class="hidden"><table><tr><th>Sev</th><th>Finding</th><th>Verdict</th><th>Agent</th></tr><tr><td colspan="4" style="color:var(--muted);text-align:center;padding:40px">Run an analysis to see findings</td></tr></table></div>
+    <div id="tab-iocs" class="hidden"><div style="color:var(--muted);text-align:center;padding:40px">Run an analysis to extract IOCs</div></div>
+    <div id="tab-mitre" class="hidden"><div style="color:var(--muted);text-align:center;padding:40px">Run an analysis to map ATT&amp;CK techniques</div></div>
+    <div id="tab-hex" class="hidden"><div style="color:var(--muted);text-align:center;padding:40px">Load a binary to view hex dump</div></div>
+  </div>
+</section>
+
+<section class="repl-side">
+  <div class="repl-header"><span class="live"></span> Investigation REPL</div>
+  <div class="thread" id="thread">
+    <div class="msg"><div class="who malvex">malvex</div><div class="body">Ready. Drop a binary on the left panel or type a prompt below.
+
+Commands: <code>!cmd</code> for terminal, <code>/doctor</code> for tool health, <code>/clear</code> to reset.
+
+Example prompts:
+  <code>Analyze malware.exe for C2 infrastructure</code>
+  <code>Decompile the main function and explain it</code>
+  <code>Scan with YARA and extract IOCs</code>
+  <code>What persistence mechanisms does this use?</code></div></div>
+  </div>
+  <form class="composer" id="composer" action="/upload" method="post" enctype="multipart/form-data">
+    <textarea id="prompt" name="custom_prompt" placeholder="Ask Malvex to analyze, decompile, scan, extract..."></textarea>
+    <div class="compose-bar">
+      <button class="cbtn" type="button" id="attach-btn">+ Attach</button>
+      <span class="file-label" id="filename">no artifact</span>
+      <select class="cbtn" name="runtime"><option value="claude">Claude</option><option value="codex">Codex</option><option value="custom">Custom</option><option value="hermes">Hermes</option><option value="ollama">Ollama</option></select>
+      <button class="cbtn" type="submit" name="mode" value="dry">Plan</button>
+      <button class="cbtn primary" type="submit" name="mode" value="real" id="run">Run ↗</button>
+    </div>
+    <input type="hidden" name="parallel" value="3">
+  </form>
+</section>
 </div>
 <script>
-const input=document.getElementById('binary'),nameEl=document.getElementById('filename'),thread=document.getElementById('thread'),empty=document.getElementById('empty'),prompt=document.getElementById('prompt'),menu=document.getElementById('addmenu');
-const nav=document.querySelector('.nav');if(nav&&!nav.querySelector('[href="/schedule"]')){const a=document.createElement('a');a.href='/schedule';a.textContent='◷ Schedules';nav.insertBefore(a,nav.lastElementChild)}if(nav&&!nav.querySelector('[href="/settings"]')){const a=document.createElement('a');a.href='/settings';a.textContent='⚙ Settings';nav.appendChild(a)}
-const chatKey='malvex-investigator-history';let chat=JSON.parse(localStorage.getItem(chatKey)||'{"name":"New investigation","messages":[]}');document.title=chat.name+' · Malvex';
-const newLink=document.querySelector('.new');newLink.addEventListener('click',e=>{e.preventDefault();const name=window.prompt('Investigation name:', 'Malware investigation');if(name){localStorage.setItem(chatKey,JSON.stringify({name,messages:[]}));location.reload()}});
-if(chat.messages.length){empty?.remove();thread.innerHTML=chat.messages.map(x=>'<div class="msg"><div class="who">'+x.who+'</div><p>'+x.text.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))+'</p></div>').join('')}
-const activeSession=new URLSearchParams(location.search).get('session');if(activeSession){empty?.remove();const box=document.createElement('div');box.className='live-analysis';box.innerHTML='<div class="live-head"><span>Live malware investigation</span><b id="live-percent">0%</b></div><div class="live-stage" id="live-stage">Starting pipeline…</div><div class="live-track"><div class="live-fill" id="live-fill" style="width:0%"></div></div><pre class="log live-log" id="live-log">Waiting for evidence…</pre>';thread.prepend(box);const esc=s=>String(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));const refreshLive=async()=>{const r=await fetch('/api/session/'+encodeURIComponent(activeSession));if(!r.ok)return;const x=await r.json();document.getElementById('live-percent').textContent=x.percent+'%';document.getElementById('live-fill').style.width=x.percent+'%';document.getElementById('live-stage').textContent=(x.done?'Complete · ':'Running · ')+x.stage+(x.target?' · '+x.target:'');document.getElementById('live-log').textContent=(x.tail||[]).join('\n');if(!x.done)setTimeout(refreshLive,1500)};refreshLive()}
-const modelSelect=document.querySelector('select[name="model"]');if(modelSelect){modelSelect.name='models';modelSelect.multiple=true;modelSelect.title='Select multiple models; first selected is primary';modelSelect.innerHTML='<option value="claude-opus-5">Claude Opus 5</option><option value="claude-opus-4-8">Claude Opus 4.8</option><option value="claude-opus-4-6" selected>Claude Opus 4.6</option><option value="claude-sonnet-5">Claude Sonnet 5</option><option value="claude-sonnet-4-6">Claude Sonnet 4.6</option><option value="gpt-5.6-sol">GPT-5.6 Sol</option><option value="gpt-5.6-terra">GPT-5.6 Terra</option><option value="gpt-5.6-luna">GPT-5.6 Luna</option><option value="gpt-5.1-codex-max">GPT-5.1 Codex Max</option><option value="gpt-5-codex">GPT-5 Codex</option><option value="custom">Custom model ID</option>'}
-const mode=document.createElement('select');mode.name='approval_mode';mode.className='chip';mode.title='Execution approval policy';mode.innerHTML='<option value="confirm-risky">Approve risky</option><option value="auto">Auto mode</option><option value="human">Human in the loop</option>';document.querySelector('.composebar').appendChild(mode);
-const palette=document.createElement('div');palette.className='command-palette';palette.innerHTML='<button data-cmd="/clear">/clear <small>clear thread</small></button><button data-cmd="/doctor">/doctor <small>check tools and MCPs</small></button><button data-cmd="/store">/store <small>open connector and skill store</small></button><button data-cmd="/focus credential-access">/focus credential-access <small>set analysis focus</small></button>';document.querySelector('.composer').prepend(palette);prompt.addEventListener('input',()=>palette.classList.toggle('open',prompt.value.trim().startsWith('/')&&!prompt.value.includes(' ')));palette.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const c=b.dataset.cmd;if(c==='/clear'){thread.innerHTML='<div class="empty"><strong>Start an investigation</strong>Ask a question or attach an artifact.</div>'}else if(c==='/doctor'){document.getElementById('health').click()}else if(c==='/store'){location.href='/store'}else{prompt.value=c+' ';prompt.focus()}palette.classList.remove('open')});
-document.getElementById('add').addEventListener('click',()=>menu.classList.toggle('open'));
-document.getElementById('choose').addEventListener('click',()=>{menu.classList.remove('open');input.click()});
-document.getElementById('addprompt').addEventListener('click',()=>{menu.classList.remove('open');prompt.value+=(prompt.value?'\n':'')+'Next step: ' ;prompt.focus()});
-document.getElementById('terminal').addEventListener('click',()=>{menu.classList.remove('open');prompt.value='!';prompt.focus()});
-document.getElementById('health').addEventListener('click',async()=>{menu.classList.remove('open');empty?.remove();const m=document.createElement('div');m.className='msg';m.innerHTML='<div class="who">malvex doctor</div><div class="tool-results"><div class="tool-group"><h3>CHECKING…</h3></div></div>';thread.appendChild(m);const r=await fetch('/api/doctor');const data=await r.json();const groups={ready:data.filter(x=>x.present&&!x.via_mcp),mcp:data.filter(x=>x.present&&x.via_mcp),missing:data.filter(x=>!x.present)};m.querySelector('.tool-results').innerHTML=Object.entries(groups).map(([k,v])=>'<div class="tool-group"><h3>'+k.toUpperCase()+' · '+v.length+'</h3>'+v.map(x=>'<div class="tool '+(k==='missing'?'missing':'ready')+'">'+(k==='missing'?'✗':'✓')+' '+x.name+(x.via_mcp?' · MCP':'')+'</div>').join('')+'</div>').join('')});
-input.addEventListener('change',()=>{const f=input.files[0];if(f)nameEl.textContent=f.name+' · '+(f.size/1024/1024).toFixed(2)+' MB'});
-document.getElementById('composer').addEventListener('submit',async e=>{if(prompt.value.trim().startsWith('!')){e.preventDefault();empty?.remove();const command=prompt.value;const m=document.createElement('div');m.className='msg';m.innerHTML='<div class="who">terminal</div><pre class="log">Running command…</pre>';thread.appendChild(m);const r=await fetch('/terminal',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command})});const data=await r.json();m.querySelector('pre').textContent=data.output||'(no output)';chat.messages.push({who:'terminal',text:data.output||'(no output)'});localStorage.setItem(chatKey,JSON.stringify(chat));prompt.value='';return}if(!input.files.length&&!/@[^\s]+/.test(prompt.value)){e.preventDefault();prompt.focus();alert('Attach an artifact with + Add or reference one with @path/to/sample.')}else{chat.messages.push({who:'analyst',text:prompt.value});localStorage.setItem(chatKey,JSON.stringify(chat))}});
+function showDebugTab(btn,id){
+  document.querySelectorAll('.debug-content>div').forEach(d=>d.classList.add('hidden'));
+  document.getElementById(id).classList.remove('hidden');
+  document.querySelectorAll('.dtab').forEach(t=>t.classList.remove('active'));
+  btn.classList.add('active');
+}
+const input=document.getElementById('binary'),nameEl=document.getElementById('filename'),thread=document.getElementById('thread'),prompt=document.getElementById('prompt');
+const chatKey='malvex-repl-history';let chat;try{chat=JSON.parse(localStorage.getItem(chatKey))||{messages:[]}}catch(e){chat={messages:[]}}
+document.getElementById('attach-btn').addEventListener('click',()=>input.click());
+input.addEventListener('change',()=>{const f=input.files[0];if(f){nameEl.textContent=f.name+' · '+(f.size/1024/1024).toFixed(1)+'MB';document.getElementById('file-info').textContent=f.name+' · '+(f.size/1024/1024).toFixed(1)+'MB'}});
+document.getElementById('composer').addEventListener('submit',async e=>{
+  if(prompt.value.trim().startsWith('!')){
+    e.preventDefault();const command=prompt.value;
+    addMsg('user',command);prompt.value='';
+    const r=await fetch('/terminal',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command})});
+    const data=await r.json();addMsg('tool',data.output||'(no output)');return;
+  }
+  if(prompt.value.trim().startsWith('/')){
+    e.preventDefault();const cmd=prompt.value.trim();prompt.value='';
+    if(cmd==='/clear'){thread.innerHTML='';chat.messages=[];try{localStorage.setItem(chatKey,JSON.stringify(chat))}catch(e){}}
+    else if(cmd==='/doctor'){addMsg('user',cmd);const r=await fetch('/api/doctor');const data=await r.json();const ok=data.filter(x=>x.present).length;addMsg('malvex','Tool health: '+ok+'/'+data.length+' available\n\n'+data.map(x=>(x.present?'✓':'✗')+' '+x.name+(x.via_mcp?' (MCP)':'')).join('\n'))}
+    return;
+  }
+  if(!input.files.length&&!/@[^\s]+/.test(prompt.value)){
+    e.preventDefault();addMsg('user',prompt.value);addMsg('malvex','Attach a binary with + Attach or reference one with @path/to/sample to start analysis.');prompt.value='';return;
+  }
+  addMsg('user',prompt.value);
+});
+function addMsg(who,text){
+  const d=document.createElement('div');d.className='msg';
+  d.innerHTML='<div class="who '+who+'">'+who+'</div><div class="body">'+text.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'})[c])+'</div>';
+  thread.appendChild(d);thread.scrollTop=thread.scrollHeight;
+  chat.messages.push({who,text});try{localStorage.setItem(chatKey,JSON.stringify(chat))}catch(e){}
+}
+if(chat.messages.length){thread.innerHTML='';chat.messages.forEach(m=>addMsg(m.who,m.text))}
 prompt.addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)){e.preventDefault();document.getElementById('run').click()}});
+const activeSession=new URLSearchParams(location.search).get('session');
+if(activeSession){
+  document.getElementById('upload-area').classList.add('hidden');
+  document.getElementById('binary-overview').classList.remove('hidden');
+  const refreshLive=async()=>{const r=await fetch('/api/session/'+encodeURIComponent(activeSession));if(!r.ok)return;const x=await r.json();
+    document.getElementById('progress-fill').style.width=x.percent+'%';
+    document.getElementById('session-log').textContent=(x.tail||[]).join('\n');
+    if(!x.done)setTimeout(refreshLive,1500)};
+  refreshLive();
+}
+['dragenter','dragover'].forEach(ev=>document.querySelector('.upload-zone')?.addEventListener(ev,e=>{e.preventDefault();e.currentTarget.style.borderColor='var(--pink)'}));
+['dragleave','drop'].forEach(ev=>document.querySelector('.upload-zone')?.addEventListener(ev,e=>{e.preventDefault();e.currentTarget.style.borderColor=''}));
+document.querySelector('.upload-zone')?.addEventListener('drop',e=>{if(e.dataTransfer.files.length){input.files=e.dataTransfer.files;input.dispatchEvent(new Event('change'))}});
 </script>
 "#;
 
