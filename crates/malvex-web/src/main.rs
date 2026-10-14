@@ -546,13 +546,12 @@ tr:hover td{background:var(--panel2)}
   <div class="debug-content" id="debug-content">
     <div id="tab-overview">
       <div class="empty-state" id="upload-area">
-        <label class="upload-zone" for="binary">
+        <div class="upload-zone" id="drop-zone" onclick="document.getElementById('binary').click()">
           <h2>Drop a file to begin</h2>
           <p>PE · ELF · Mach-O · APK · script · installer · firmware</p>
           <p>PDF · DOC/DOCX · XLS/XLSX · PPT/PPTX · RTF · HWP · OLE · OneNote</p>
           <p style="margin-top:12px;color:var(--cyan)">or type a prompt in the REPL →</p>
-          <input class="hidden" id="binary" type="file" name="binary" accept="*/*">
-        </label>
+        </div>
       </div>
       <div id="binary-overview" class="hidden">
         <div class="info-grid" id="info-grid"></div>
@@ -587,6 +586,7 @@ Example prompts:
   <code>What persistence mechanisms does this use?</code></div></div>
   </div>
   <form class="composer" id="composer" action="/upload" method="post" enctype="multipart/form-data">
+    <input class="hidden" id="binary" type="file" name="binary" accept="*/*">
     <textarea id="prompt" name="custom_prompt" placeholder="Ask Malvex to analyze, decompile, scan, extract..."></textarea>
     <div class="compose-bar">
       <button class="cbtn" type="button" id="attach-btn">+ Attach</button>
@@ -675,9 +675,12 @@ if(activeSession){
     if(!x.done)setTimeout(refreshLive,1500)};
   refreshLive();
 }
-['dragenter','dragover'].forEach(ev=>document.querySelector('.upload-zone')?.addEventListener(ev,e=>{e.preventDefault();e.currentTarget.style.borderColor='var(--pink)'}));
-['dragleave','drop'].forEach(ev=>document.querySelector('.upload-zone')?.addEventListener(ev,e=>{e.preventDefault();e.currentTarget.style.borderColor=''}));
-document.querySelector('.upload-zone')?.addEventListener('drop',e=>{if(e.dataTransfer.files.length){input.files=e.dataTransfer.files;input.dispatchEvent(new Event('change'))}});
+const dropZone=document.getElementById('drop-zone');
+if(dropZone){
+['dragenter','dragover'].forEach(ev=>dropZone.addEventListener(ev,e=>{e.preventDefault();dropZone.style.borderColor='var(--pink)'}));
+['dragleave','drop'].forEach(ev=>dropZone.addEventListener(ev,e=>{e.preventDefault();dropZone.style.borderColor=''}));
+dropZone.addEventListener('drop',e=>{if(e.dataTransfer.files.length){input.files=e.dataTransfer.files;input.dispatchEvent(new Event('change'))}});
+}
 </script>
 "#;
 
