@@ -1,0 +1,23 @@
+[package]
+name = "malvex-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "malvex-web"
+path = "src/main.rs"
+
+[dependencies]
+sasf-core = { path = "../sasf-core" }
+sasf-orchestrator = { path = "../sasf-orchestrator" }
+sasf-doctor = { path = "../sasf-doctor" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "fs", "time"] }
+base64 = "0.22"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+walkdir = "2"
+regex = "1"

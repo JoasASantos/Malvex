@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sasf-core",
+    "crates/sasf-doctor",
+    "crates/sasf-tools",
+    "crates/sasf-orchestrator",
+    "crates/sasf-cli",
+    "crates/sasf-web",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Malvex contributors"]
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 2

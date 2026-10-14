@@ -1,0 +1,36 @@
+# Rust build
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Session output — contains client findings / extracted binaries. NEVER publish.
+/sessions/
+
+# Analyzed targets — client binaries, app bundles, installers. NEVER publish.
+/targets/
+*.app/
+*.msi
+*.cab
+*.exe
+*.dll
+*.dylib
+*.macho
+*.extracted/
+
+# IDA databases
+*.i64
+*.idb
+*.til
+*.id0
+*.id1
+*.id2
+*.nam
+
+# Generated reports (may embed client data)
+*.pdf
+/dist/
+
+# OS / editor
+.DS_Store
+*.swp
+.claude/

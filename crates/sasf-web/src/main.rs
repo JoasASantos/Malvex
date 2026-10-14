@@ -1,0 +1,2087 @@
+//! malvex-web — browser front-end for the Malvex reverse-engineering harness.
+//!
+//! - `/`                       upload a binary, plan (dry-run) or launch a real pipeline run
+//! - `/sessions`                dashboard of every session under `<root>/sessions/`
+//! - `/session/:id`             detail: live stage progress, findings summary, downloads
+//! - `/session/:id/file/:name`  serve one allow-listed artifact (findings.json, attack-graph, ...)
+//!
+//! Real runs are launched via `tokio::process::Command` and NEVER awaited synchronously —
+//! a real analysis takes minutes to hours (parallel Opus agents over IDA/Ghidra/Frida), so
+//! the upload handler only waits long enough to read the pipeline's own "SESSION: <id>"
+//! startup banner off stdout, then redirects to `/session/:id` and detaches. A background
+//! task keeps draining the child's stdout/stderr to EOF (discarded — `session.log`, written
+//! by the orchestrator itself, is the source of truth for progress) so the child never blocks
+//! on a full pipe, and reaps it on exit.
+
+use axum::{
+    body::Body,
+    extract::{Form, Multipart, Path, Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Json, Redirect, Response},
+    routing::{get, post},
+    Router,
+};
+use sasf_core::{Finding, Severity, Target, Verdict};
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Clone)]
+struct AppState {
+    root: PathBuf,
+    uploads: PathBuf,
+    /// HTTP Basic Auth credentials gating every route except /health. A live analysis run
+    /// executes local agent tooling against an uploaded sample, so this service must never
+    /// be exposed unauthenticated.
+    auth: (String, String),
+}
+
+/// HTTP Basic Auth, checked in constant-ish time (byte-for-byte via a fixed-size compare
+/// isn't feasible with variable-length secrets over a plain `==`, but the tunnel's TLS
+/// termination is the real timing-safety boundary here, not this check — this exists to
+/// stop a stray/shared link from being a walk-in RCE trigger, not to resist a targeted
+/// timing attack against a single analyst's local tunnel session).
+async fn require_auth(State(st): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+    let unauthorized = || {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::WWW_AUTHENTICATE, "Basic realm=\"malvex\"")
+            .body(Body::from("authentication required"))
+            .unwrap()
+    };
+    let Some(hv) = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
+        return unauthorized();
+    };
+    let Some(b64) = hv.strip_prefix("Basic ") else {
+        return unauthorized();
+    };
+    let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64) else {
+        return unauthorized();
+    };
+    let Ok(decoded) = String::from_utf8(decoded) else {
+        return unauthorized();
+    };
+    let Some((user, pass)) = decoded.split_once(':') else {
+        return unauthorized();
+    };
+    if user == st.auth.0 && pass == st.auth.1 {
+        next.run(req).await
+    } else {
+        unauthorized()
+    }
+}
+
+/// A short random alphanumeric string — used to generate a fresh Basic Auth password on
+/// every startup when MALVEX_WEB_PASS isn't set, so "just run it" can never mean "open to
+/// whoever gets the tunnel URL" by accident.
+fn random_token(len: usize) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    // No RNG dependency in this crate — seed from time + PID + address entropy, xorshift it.
+    let mut seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+        ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15)
+        ^ (&ALPHABET as *const _ as u64);
+    let mut out = String::with_capacity(len);
+    for _ in 0..len {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        out.push(ALPHABET[(seed as usize) % ALPHABET.len()] as char);
+    }
+    out
+}
+
+fn env_first(keys: &[&str], default: &str) -> String {
+    keys.iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| default.to_string())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let root = env_first(&["MALVEX_ROOT", "SASF_ROOT"], ".");
+    let uploads = env_first(&["MALVEX_UPLOADS", "SASF_UPLOADS"], "/tmp/malvex-uploads");
+    std::fs::create_dir_all(&uploads).ok();
+
+    let user = env_first(&["MALVEX_WEB_USER", "SASF_WEB_USER"], "malvex");
+    let (pass, generated) = match std::env::var("MALVEX_WEB_PASS")
+        .or_else(|_| std::env::var("SASF_WEB_PASS"))
+    {
+        Ok(p) if !p.is_empty() => (p, false),
+        _ => (random_token(16), true),
+    };
+    if generated {
+        println!("[malvex-web] MALVEX_WEB_PASS not set — generated a one-time password for this run:");
+        println!("[malvex-web]   user={user}  pass={pass}");
+        println!("[malvex-web] set MALVEX_WEB_USER/MALVEX_WEB_PASS to pin credentials across restarts.");
+    }
+
+    let state = Arc::new(AppState { root: root.into(), uploads: uploads.into(), auth: (user, pass) });
+
+    // Malware targets are real installers/.app bundles — tens to hundreds of MB, well past
+    // axum's default 2MB request-body limit. Without this, any real upload silently failed
+    // partway through and rendered as an indistinguishable "no file received".
+    const MAX_UPLOAD_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2GB
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/store", get(store))
+        .route("/schedule", get(schedule_page).post(create_schedule))
+        .route("/settings", get(settings_page))
+        .route("/api/doctor", get(api_doctor))
+        .route("/api/session/:id", get(api_session))
+        .route("/terminal", post(terminal))
+        .route(
+            "/upload",
+            post(upload).layer(axum::extract::DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
+        .route("/sessions", get(sessions_dashboard))
+        .route("/session/:id", get(session_detail))
+        .route("/session/:id/resume", post(resume_session))
+        .route("/session/:id/edit/:name", get(edit_file).post(save_file))
+        .route("/session/:id/file/:name", get(session_file))
+        .route("/threatintel", get(threatintel_page))
+        .route("/eventscan", get(eventscan_page).post(eventscan_run))
+        .route("/lookup", get(lookup_page).post(lookup_run))
+        .route("/procdb", get(procdb_page).post(procdb_add))
+        .route("/remotebox", get(remotebox_page).post(remotebox_add))
+        .route("/health", get(|| async { "ok" }))
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .with_state(state);
+
+    let addr = env_first(&["MALVEX_ADDR", "SASF_ADDR"], "127.0.0.1:8787");
+    println!("[malvex-web] listening on http://{addr}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+// ── Page shell ───────────────────────────────────────────────────────────────
+
+const STYLE: &str = r#"
+:root{--bg:#0b0d12;--ink:#e7ebf3;--dim:#8791a5;--card:#111824;--border:#273043;
+      --text:#e8e8e8;--gold:#ffcc33;--pink:#ff3f8e;--violet:#7c3aed;--ok:#3ddc84}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:15px/1.5 ui-sans-serif,system-ui,sans-serif;margin:0;overflow-x:hidden}
+.wrap{width:min(1100px,100%);margin:0 auto;padding:1.5rem clamp(1rem,4vw,2.5rem) 4rem}
+nav{display:flex;align-items:center;gap:1rem;margin-bottom:2rem;border-bottom:1px solid var(--border);padding:0 0 1rem;flex-wrap:wrap}
+nav a{color:var(--dim);text-decoration:none;font-size:.92rem}
+nav a.brand{color:var(--ink);font-weight:800;font-size:1.15rem;margin-right:auto;
+            display:flex;align-items:center;gap:.4rem}
+nav a.brand .dot{width:.5em;height:.5em;border-radius:50%;
+    background:radial-gradient(circle at 35% 30%,#fff3c4,var(--gold) 60%)}
+nav a.active,nav a:hover{color:var(--ink);font-weight:600}
+h1,h2,h3{margin-top:0;color:var(--ink);letter-spacing:-.025em}
+.card{background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:16px;
+      padding:1.5rem;margin-bottom:1.5rem;box-shadow:0 14px 34px -20px rgba(0,0,0,.3)}
+.card h3{color:var(--text)}
+.card a{color:var(--gold)}
+table{width:100%;border-collapse:collapse;font-size:.88rem;color:var(--text)}
+th,td{text-align:left;padding:.55rem .75rem;border-bottom:1px solid var(--border);white-space:nowrap}
+td.wrap-cell{white-space:normal}
+th{color:#8f8f8f;font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.04em}
+tr:hover td{background:#191919}
+.scroll{overflow:auto;max-height:520px}
+.badge{display:inline-block;padding:.15rem .6rem;border-radius:99px;font-size:.72rem;font-weight:700}
+.b-crit{background:#3a1424;color:#ff6fa8}
+.b-high{background:#3a2410;color:var(--gold)}
+.b-med{background:#332c10;color:#e0d068}
+.b-low{background:#122c2a;color:#5ed0c0}
+.b-info{background:#1c1c1c;color:var(--dim)}
+.b-confirmed{background:#0f3320;color:var(--ok)}
+.b-plausible{background:#332c10;color:var(--gold)}
+.b-refuted{background:#241318;color:var(--dim)}
+.b-pending{background:#1c1c1c;color:var(--dim)}
+.b-run{background:#2a2010;color:var(--gold)}
+.b-done{background:#0f3320;color:var(--ok)}
+.b-pend{background:#1c1c1c;color:var(--dim)}
+.stagebar{display:flex;flex-wrap:wrap;gap:.5rem;margin:1rem 0}
+.progress-head{display:flex;justify-content:space-between;color:#8f8f8f;font-size:.78rem;margin-top:1rem}.progress-head b{color:var(--ok)}.progress-track{height:6px;background:#252525;border-radius:99px;overflow:hidden;margin:.45rem 0 .8rem}.progress-fill{height:100%;background:linear-gradient(90deg,var(--pink),var(--violet));border-radius:99px;transition:width .4s ease}
+.stage{padding:.4rem .8rem;border-radius:8px;font-size:.82rem;border:1px solid var(--border);color:var(--dim)}
+.stage.done{background:#0f3320;color:var(--ok);border-color:#1e5a30}
+.stage.running{background:#2a2010;color:var(--gold);border-color:#4a3a10;animation:pulse 1.6s ease-in-out infinite}
+.stage.pending{color:#666}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+a.btn{display:inline-block;background:linear-gradient(135deg,var(--pink),var(--violet));color:#fff;border:0;
+      padding:.55rem 1.2rem;border-radius:999px;font-weight:700;text-decoration:none;font-size:.86rem;
+      margin:.2rem .4rem .2rem 0;box-shadow:0 6px 18px -8px rgba(255,63,142,.55)}
+a.btn.ghost{background:#1e1e1e;color:var(--text);border:1px solid #333;box-shadow:none}
+pre.log{background:#000;color:#9a9a9a;font:12px/1.5 ui-monospace,monospace;padding:1rem;
+        border-radius:8px;overflow:auto;max-height:420px;margin:0}
+.dim{color:var(--dim)}
+"#;
+
+fn layout(title: &str, active: &str, body: &str) -> Html<String> {
+    let _ = active;
+    Html(format!(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
+         <title>{title} — Malvex</title><style>{STYLE}</style>\
+         <body><div class=wrap>\
+         <nav><a class=brand href=\"/\">Malvex<span class=dot></span></a><a href=\"/\">Investigator</a><a href=\"/sessions\">Sessions</a><a href=\"/threatintel\">Threat Intel</a><a href=\"/eventscan\">Event Scan</a><a href=\"/lookup\">Intel Lookup</a><a href=\"/procdb\">Proc DB</a><a href=\"/remotebox\">Remote Box</a><a href=\"/store\">Store</a><a href=\"/schedule\">Schedules</a><a href=\"/settings\">Settings</a></nav>\
+         {body}\
+         </div></body>",
+    ))
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Extract IOCs (IPs, domains, hashes, URLs) from evidence text using regex.
+fn extract_iocs(text: &str) -> Vec<(String, String)> {
+    let mut iocs = Vec::new();
+    // IPv4
+    if let Ok(re) = regex::Regex::new(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b") {
+        for cap in re.captures_iter(text) {
+            let ip = cap[1].to_string();
+            if !ip.starts_with("0.") && !ip.starts_with("127.") && !ip.starts_with("255.") {
+                iocs.push(("ip".into(), ip));
+            }
+        }
+    }
+    // URLs
+    if let Ok(re) = regex::Regex::new(r#"(https?://[^\s<>"'\)]+)"#) {
+        for cap in re.captures_iter(text) {
+            iocs.push(("url".into(), cap[1].to_string()));
+        }
+    }
+    // Domains (simple heuristic)
+    if let Ok(re) = regex::Regex::new(r"\b([a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.(?:com|net|org|io|info|biz|xyz|top|ru|cn|tk|ml|ga|cf|pw|cc|ws|click|link|download|zip|mov|app))\b") {
+        for cap in re.captures_iter(text) {
+            iocs.push(("domain".into(), cap[1].to_string()));
+        }
+    }
+    // SHA256
+    if let Ok(re) = regex::Regex::new(r"\b([a-fA-F0-9]{64})\b") {
+        for cap in re.captures_iter(text) {
+            iocs.push(("sha256".into(), cap[1].to_string()));
+        }
+    }
+    // SHA1
+    if let Ok(re) = regex::Regex::new(r"\b([a-fA-F0-9]{40})\b") {
+        for cap in re.captures_iter(text) {
+            iocs.push(("sha1".into(), cap[1].to_string()));
+        }
+    }
+    // MD5
+    if let Ok(re) = regex::Regex::new(r"\b([a-fA-F0-9]{32})\b") {
+        for cap in re.captures_iter(text) {
+            iocs.push(("md5".into(), cap[1].to_string()));
+        }
+    }
+    // Deduplicate
+    iocs.sort();
+    iocs.dedup();
+    iocs
+}
+
+/// Extract MITRE ATT&CK technique IDs from vuln_class field (e.g. "T1055", "T1059.001")
+fn extract_mitre_techniques(vuln_class: &str) -> Vec<String> {
+    if let Ok(re) = regex::Regex::new(r"(T\d{4}(?:\.\d{3})?)") {
+        re.captures_iter(vuln_class)
+            .map(|cap| cap[1].to_string())
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+// ── Pipeline liveness (PID lock) ─────────────────────────────────────────────
+// A session sitting on a stage for hours looks IDENTICAL from session.log alone (an
+// AGENT_START with no matching AGENT_DONE) whether the underlying process is genuinely still
+// grinding away or has been dead for hours — that ambiguity is exactly what made an actually-
+// still-running session look indistinguishable from a silently-killed one. Every spawn (fresh
+// upload or resume) drops the child's PID into `<session>/.pipeline.pid`; the dashboard then
+// asks the OS directly (`kill -0`) whether that PID is real, rather than guessing from log
+// content, and only offers to resume when it can confirm nothing is already running.
+
+fn write_pid_lock(session_dir: &FsPath, pid: u32) {
+    std::fs::create_dir_all(session_dir).ok();
+    std::fs::write(session_dir.join(".pipeline.pid"), pid.to_string()).ok();
+}
+
+fn read_pid_lock(session_dir: &FsPath) -> Option<u32> {
+    std::fs::read_to_string(session_dir.join(".pipeline.pid")).ok()?.trim().parse().ok()
+}
+
+/// `kill -0 <pid>` sends no signal, just checks whether the OS still has a process at that
+/// PID — the standard portable way to ask "is this still alive" without owning the process
+/// (we never do — the whole point is these survive independently of the web process).
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Fallback for sessions that predate the PID-lock feature (every session that existed before
+/// this shipped — including a real production run this was written specifically because of):
+/// no `.pipeline.pid` file does NOT mean nothing is running, it can just mean the lock was
+/// never written. Search live `sasf run` processes for one whose command line contains this
+/// exact target path (present in argv for both a fresh run and a `--resume` run) — if found,
+/// write the lock retroactively so future checks are instant, and report it alive. Without
+/// this, a legacy session's Resume button would let someone launch a SECOND process racing
+/// the still-live one on the same findings.json/session.log.
+fn find_and_lock_live_pid(session_dir: &FsPath, target_path: &str) -> Option<u32> {
+    let out = std::process::Command::new("pgrep").args(["-f", target_path]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Ok(pid) = line.trim().parse::<u32>() {
+            // pgrep -f matches ANY process with this string in its argv, including e.g. a
+            // shell that happens to mention the path (unlikely here, but cheap to guard):
+            // confirm the matched process's own command line actually looks like a `sasf run`
+            // invocation before trusting it.
+            let cmdline = std::process::Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "command="])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            if cmdline.contains("sasf") && cmdline.contains("run") {
+                write_pid_lock(session_dir, pid);
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+// ── Index / upload ───────────────────────────────────────────────────────────
+
+async fn store() -> Html<String> {
+    let body = r#"
+    <h1>Connector &amp; Skill Store</h1>
+    <p class="dim">Extend Malvex with local skills, MCP servers, and authenticated external connectors.</p>
+    <div class="card"><h3>AI runtimes</h3><p>Claude and Codex subscriptions use the active local CLI login. API gateways use the custom runtime profile and never receive credentials from Malvex.</p><span class="badge b-confirmed">available</span></div>
+    <div class="card"><h3>Investigation skills</h3><p>Malware triage, static RE, unpacking, dynamic analysis, memory, network, ATT&amp;CK, IOC extraction, lineage, and detection engineering.</p><a class="btn" href="/">Use in Investigator</a></div>
+    <div class="card"><h3>Connectors</h3><p>Gmail · Jira · GitHub · Slack · SIEM · threat-intelligence feeds</p><p class="dim">Connectors are installed as MCP integrations and require your own OAuth/API credentials. Secrets stay in the local credential store.</p><a class="btn ghost" href="/">Configure from Investigator</a></div>
+    <div class="card"><h3>Build a skill</h3><p>Add a <code>skills/&lt;name&gt;/SKILL.md</code> with frontmatter, evidence rules, and verification steps. The next run discovers it automatically.</p></div>
+    "#;
+    layout("store", "/store", body)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Schedule { name: String, prompt: String, cron: String, runtime: String, models: Vec<String> }
+
+#[derive(serde::Deserialize)]
+struct ScheduleRequest { name: String, prompt: String, cron: String, runtime: String, models: String }
+
+async fn schedule_page(State(st): State<Arc<AppState>>) -> Html<String> {
+    let path = st.root.join("data/schedules.json");
+    let schedules: Vec<Schedule> = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    let rows = if schedules.is_empty() { "<p class=dim>No schedules yet.</p>".to_string() } else { schedules.iter().map(|s| format!("<div class=card><h3>{}</h3><p><code>{}</code></p><p>{}</p><span class=badge>{}</span> <span class=badge>{}</span></div>", html_escape(&s.name), html_escape(&s.cron), html_escape(&s.prompt), html_escape(&s.runtime), html_escape(&s.models.join(", ")))).collect() };
+    let body = format!("<h1>Schedules</h1><p class=dim>Persist investigation jobs and review them before enabling execution.</p><div class=card><form method=post action=/schedule><p><input name=name placeholder='Schedule name' required></p><p><input name=cron placeholder='Cron, e.g. 0 9 * * *' required></p><p><input name=prompt placeholder='Prompt or @path/to/sample' required></p><p><select name=runtime><option value=claude>Claude subscription</option><option value=codex>Codex subscription</option><option value=custom>Custom / API</option></select> <input name=models value='claude-opus-4-6,claude-sonnet-4-6'></p><button class=btn type=submit>Save schedule</button></form></div>{rows}<a class='btn ghost' href='/'>Back to Investigator</a>");
+    layout("schedules", "/schedule", &body)
+}
+
+async fn settings_page() -> Html<String> {
+    let body = r#"<h1>Settings</h1><p class=dim>Configure the local Malvex execution boundary. Credentials remain managed by the provider CLI or environment.</p>
+    <div class=card><h3>AI runtimes</h3><p><b>Claude subscription</b> · active local CLI session</p><p><b>Codex subscription</b> · active local CLI session</p><p><b>Custom / API gateway</b> · configured through <code>MALVEX_CUSTOM_CMD</code></p></div>
+    <div class=card><h3>Model catalog</h3><p>Primary and fallback models are selected per investigation. Custom model IDs are accepted for OpenAI-compatible gateways.</p><p class=dim>Claude Opus 5 · Opus 4.8 · Opus 4.6 · Sonnet 5 · Sonnet 4.6<br>GPT-5.6 Sol · GPT-5.6 Terra · GPT-5.6 Luna · GPT-5.1 Codex Max · GPT-5 Codex</p></div>
+    <div class=card><h3>Approval policy</h3><p>Auto mode · Approve risky actions · Human in the loop</p><p class=dim>Terminal commands and agent actions must remain auditable. Destructive commands are blocked by the local REPL policy.</p></div>
+    <div class=card><h3>Workspace</h3><p><code>/opt/MalvexAI</code> · sessions, reports, schedules, skills and MCP configuration.</p><a class='btn' href='/'>Back to Investigator</a> <a class='btn ghost' href='/api/doctor'>View tool health JSON</a></div>"#;
+    layout("settings", "/settings", body)
+}
+
+async fn create_schedule(State(st): State<Arc<AppState>>, Form(req): Form<ScheduleRequest>) -> Redirect {
+    let path = st.root.join("data/schedules.json");
+    let mut schedules: Vec<Schedule> = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    schedules.push(Schedule { name: req.name.chars().take(120).collect(), prompt: req.prompt.chars().take(4000).collect(), cron: req.cron.chars().take(100).collect(), runtime: req.runtime, models: req.models.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).take(12).collect() });
+    if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+    let _ = std::fs::write(path, serde_json::to_string_pretty(&schedules).unwrap_or_else(|_| "[]".into()));
+    Redirect::to("/schedule")
+}
+
+#[derive(serde::Deserialize)]
+struct TerminalRequest { command: String }
+
+#[derive(serde::Serialize)]
+struct TerminalResponse { ok: bool, output: String }
+
+async fn api_doctor() -> Json<Vec<sasf_core::tool::ToolStatus>> {
+    Json(sasf_doctor::scan(sasf_core::Platform::current()))
+}
+
+async fn terminal(State(st): State<Arc<AppState>>, Form(req): Form<TerminalRequest>) -> Json<TerminalResponse> {
+    let command = req.command.trim().trim_start_matches('!').trim().to_string();
+    if command.is_empty() || command.len() > 4000 {
+        return Json(TerminalResponse { ok: false, output: "command must be between 1 and 4000 characters".into() });
+    }
+    let lower = command.to_ascii_lowercase();
+    let blocked = ["rm -rf", "mkfs", "shutdown", "reboot", "sudo ", "dd if=", ":(){", "chmod -r 777"];
+    if blocked.iter().any(|needle| lower.contains(needle)) {
+        return Json(TerminalResponse { ok: false, output: "blocked by Malvex safety policy; run destructive administration outside the REPL".into() });
+    }
+    let output = tokio::time::timeout(Duration::from_secs(60), tokio::process::Command::new("/bin/sh")
+        .arg("-lc").arg(&command).current_dir(&st.root).output()).await;
+    match output {
+        Ok(Ok(out)) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            Json(TerminalResponse { ok: out.status.success(), output: text.chars().take(12000).collect() })
+        }
+        Ok(Err(e)) => Json(TerminalResponse { ok: false, output: format!("terminal spawn failed: {e}") }),
+        Err(_) => Json(TerminalResponse { ok: false, output: "terminal command timed out after 60 seconds".into() }),
+    }
+}
+
+async fn index() -> Html<String> {
+    Html(REPL_PAGE.to_string())
+}
+
+// Malvex investigator workspace. The REPL is intentionally the primary surface: every
+// analysis request is a prompt plus an optional local artifact, and the existing multipart
+// pipeline endpoint remains the execution boundary.
+const REPL_PAGE: &str = r#"<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Malvex · Investigator</title>
+<style>
+:root{--bg:#0b0d12;--panel:#11151d;--panel2:#171c26;--line:#273043;--text:#e7ebf3;--muted:#8791a5;--blue:#82a9ff;--cyan:#65d4df;--green:#65d39a;--amber:#e8bd71;--red:#ed7777}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:14px/1.45 Inter,ui-sans-serif,system-ui,sans-serif}body{display:flex;min-height:100vh}
+.shell{display:grid;grid-template-columns:248px minmax(0,1fr) 290px;width:100vw;min-height:100vh}.side,.right{background:var(--panel);border-color:var(--line)}.side{border-right:1px solid var(--line);padding:18px 14px;display:flex;flex-direction:column}.right{border-left:1px solid var(--line);padding:18px 16px}.brand{font-size:18px;font-weight:750;letter-spacing:-.03em;display:flex;align-items:center;gap:9px;margin:3px 8px 28px}.mark{width:20px;height:20px;border:2px solid var(--blue);border-radius:5px;transform:rotate(45deg);position:relative}.mark:after{content:"";position:absolute;background:var(--bg);width:8px;height:8px;left:4px;top:4px}.new{display:block;text-decoration:none;color:#07101f;background:var(--blue);font-weight:700;padding:10px 12px;border-radius:8px;margin-bottom:22px}.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.12em;margin:15px 8px 8px}.nav a,.session{display:block;color:var(--muted);text-decoration:none;padding:8px 9px;border-radius:6px}.nav a:hover,.session:hover{background:var(--panel2);color:var(--text)}.session{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.status{margin-top:auto;color:var(--muted);font-size:11px;padding:10px 8px;border-top:1px solid var(--line)}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:6px}
+.main{display:flex;flex-direction:column;min-width:0}.top{height:58px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 24px}.crumb{color:var(--muted);font-size:12px}.crumb b{color:var(--text);font-weight:600}.top a{color:var(--muted);text-decoration:none;font-size:12px}.workspace{width:min(900px,calc(100% - 48px));margin:0 auto;padding:32px 0 22px;display:flex;flex-direction:column;flex:1}.welcome{margin:22px 0 28px}.eyebrow{color:var(--blue);font-size:11px;text-transform:uppercase;letter-spacing:.14em}.welcome h1{font-size:28px;letter-spacing:-.04em;margin:8px 0}.welcome p{color:var(--muted);max-width:680px;margin:0}.thread{flex:1;min-height:210px;border:1px solid var(--line);background:linear-gradient(180deg,#10151e,#0d1118);border-radius:10px;padding:20px;overflow:auto}.empty{text-align:center;color:var(--muted);padding:42px 20px}.empty strong{display:block;color:var(--text);font-size:15px;margin-bottom:7px}.msg{border-bottom:1px solid var(--line);padding:0 0 16px;margin-bottom:16px}.msg .who{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--blue);margin-bottom:6px}.msg p{margin:0;white-space:pre-wrap}.composer{margin-top:14px;border:1px solid #3b4f74;background:#111824;border-radius:10px;padding:12px}.composer:focus-within{border-color:var(--blue);box-shadow:0 0 0 2px #82a9ff22}.composer textarea{display:block;width:100%;min-height:74px;resize:vertical;border:0;outline:0;background:transparent;color:var(--text);font:14px/1.5 inherit}.composer textarea::placeholder{color:#69758a}.composebar{display:flex;align-items:center;gap:8px;border-top:1px solid var(--line);padding-top:10px}.filebtn,.chip,.run{border:1px solid var(--line);background:var(--panel2);color:var(--muted);border-radius:6px;padding:7px 10px;font:inherit;font-size:12px;cursor:pointer}.filebtn:hover,.chip:hover{color:var(--text);border-color:#536887}.run{margin-left:auto;background:var(--blue);border-color:var(--blue);color:#07101f;font-weight:700}.run:disabled{opacity:.45;cursor:not-allowed}.filename{color:var(--cyan);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hint{color:var(--muted);font-size:11px;margin-top:10px}.right h2{font-size:13px;margin:3px 0 17px}.card{border:1px solid var(--line);background:var(--panel2);border-radius:8px;padding:12px;margin-bottom:12px}.card h3{font-size:12px;margin:0 0 9px}.kv{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:11px;padding:4px 0}.kv span:last-child{color:var(--text);text-align:right}.cap{display:inline-block;border:1px solid #34516a;color:var(--cyan);border-radius:4px;padding:3px 5px;font-size:10px;margin:2px}.legend{color:var(--muted);font-size:11px;line-height:1.6}.hidden{display:none}@media(max-width:950px){.shell{grid-template-columns:210px minmax(0,1fr)}.right{display:none}}@media(max-width:620px){.shell{display:block}.side{display:none}.workspace{width:calc(100% - 28px);padding-top:18px}.top{padding:0 14px}}
+</style>
+<style>
+.chip select{background:transparent;border:0;outline:0;color:var(--text);font:inherit;font-size:11px;cursor:pointer}.chip select option{background:#171c26;color:#e7ebf3}.chip select[multiple]{min-width:170px;max-width:230px;height:25px}.addmenu{display:none;position:absolute;left:12px;bottom:58px;width:270px;background:#202631;border:1px solid #3a465b;border-radius:9px;padding:7px;box-shadow:0 18px 45px #0009;z-index:3}.addmenu.open{display:block}.addmenu button,.addmenu a{display:block;width:100%;text-align:left;background:transparent;border:0;color:var(--text);padding:9px;border-radius:6px;font:inherit;font-size:12px;cursor:pointer;text-decoration:none}.addmenu button:hover,.addmenu a:hover{background:#303949}.addmenu small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.tool-results{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.tool-group{border:1px solid var(--line);background:#121923;border-radius:8px;padding:10px}.tool-group h3{font-size:11px;margin:0 0 7px;color:var(--text)}.tool{font:11px/1.5 ui-monospace,monospace;color:var(--muted);padding:2px 0}.tool.ready{color:var(--green)}.tool.missing{color:var(--red)}
+</style>
+<style>
+.composer textarea{font-size:18px!important;line-height:1.6;min-height:110px}.command-palette{display:none;position:absolute;left:12px;right:12px;bottom:58px;background:#202631;border:1px solid #3a465b;border-radius:9px;padding:6px;box-shadow:0 18px 45px #0009;z-index:4}.command-palette.open{display:block}.command-palette button{display:block;width:100%;text-align:left;background:transparent;border:0;color:var(--text);padding:10px;border-radius:6px;font:14px ui-monospace,monospace;cursor:pointer}.command-palette button:hover{background:#303949}.command-palette small{color:var(--muted);font:11px ui-sans-serif}
+.live-analysis{border:1px solid #3b4f74;background:#111824;border-radius:8px;padding:14px;margin-bottom:14px}.live-head{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}.live-head b{color:var(--green)}.live-track{height:7px;background:#252b35;border-radius:99px;overflow:hidden;margin:9px 0}.live-fill{height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));transition:width .5s}.live-stage{color:var(--text);font-weight:650}.live-log{max-height:170px;margin:10px 0 0}
+</style>
+<style>
+/* Malvex responsive shell: stable columns, readable controls, no horizontal overflow. */
+body{overflow-x:hidden}.shell{grid-template-columns:240px minmax(0,1fr) 280px;min-width:0}.side,.right,.main{min-width:0}.side{padding:20px 14px}.brand{margin-bottom:24px}.nav{display:grid;gap:2px}.nav a{font-size:13px}.top{height:56px;padding:0 clamp(14px,3vw,32px)}.workspace{width:min(980px,calc(100% - 40px));padding:28px 0 24px}.welcome h1{font-size:clamp(25px,3vw,36px)}.thread{min-height:280px;padding:clamp(16px,3vw,28px)}.msg{max-width:860px}.msg p,.msg pre{font-size:15px}.msg pre,.log{margin:10px 0 0;white-space:pre-wrap;overflow:auto;background:#0a0e15;border:1px solid var(--line);border-radius:7px;padding:13px;color:#d8e3f5;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}.composer{position:relative;padding:14px}.composebar{flex-wrap:wrap}.chip{min-height:36px;display:inline-flex;align-items:center;gap:5px}.chip select[multiple]{height:76px;min-width:215px;max-width:260px;padding:4px}.run{min-height:36px}.addmenu,.command-palette{bottom:64px;max-width:min(320px,calc(100vw - 32px))}.right{padding:20px 16px;overflow:auto}.card{overflow:hidden}.tool-results{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}.tool{overflow-wrap:anywhere}@media(max-width:1100px){.shell{grid-template-columns:220px minmax(0,1fr)}.right{display:none}}@media(max-width:700px){body{font-size:14px}.shell{display:block}.side{display:block;border-right:0;border-bottom:1px solid var(--line);padding:10px 12px}.brand{margin:0 8px 10px}.new{margin-bottom:10px}.label{margin-top:10px}.nav{display:flex;overflow:auto}.nav a{white-space:nowrap}.status,.side>.label:last-of-type,.side>.session{display:none}.top{height:48px}.workspace{width:calc(100% - 24px);padding:18px 0}.welcome{margin:8px 0 18px}.welcome p{font-size:13px}.thread{min-height:220px}.composer textarea{min-height:130px}.composebar{align-items:stretch}.composebar>*{max-width:100%}.filename{order:2;flex:1;min-width:120px}.run{width:100%;margin-left:0}.chip{flex:1}.chip select[multiple]{width:100%;min-width:0}.addmenu,.command-palette{left:8px;right:8px;bottom:74px;width:auto}}
+</style>
+<div class="shell">
+<aside class="side"><div class="brand"><span class="mark"></span>malvex</div><a class="new" href="/">+ New investigation</a><div class="label">Workspace</div><nav class="nav"><a href="/">⌘ Investigator</a><a href="/sessions">◫ Sessions</a><a href="/store">◇ Connector &amp; Skill Store</a></nav><div class="label">Recent</div><div class="session">No investigation selected</div><div class="status"><span class="dot"></span>local runtime · protected</div></aside>
+<main class="main"><header class="top"><div class="crumb">workspace / <b>investigator</b></div><a href="/sessions">sessions →</a></header><section class="workspace"><div class="welcome"><div class="eyebrow">Malvex · AI reverse-engineering investigator</div><h1>What are we investigating?</h1><p>Ask a question, attach an artifact, and follow hypotheses, evidence, and verification in one flow.</p></div><div class="thread" id="thread"><div class="empty" id="empty"><strong>Start an investigation</strong>Use <code>!</code> for a local terminal command, or add several prompts before running.</div></div><form class="composer" id="composer" action="/upload" method="post" enctype="multipart/form-data"><div class="addmenu" id="addmenu"><button type="button" id="choose">＋ Attach artifact<small>PE, ELF, Mach-O, script, folder archive</small></button><button type="button" id="addprompt">＋ Add another prompt<small>Build a multi-step investigation request</small></button><button type="button" id="health">◉ Check tools and MCPs<small>Run the Malvex doctor health check</small></button><button type="button" id="terminal">$ Terminal command<small>Type !command in the prompt to execute locally</small></button><a href="/store">◇ Open connector &amp; skill store</a></div><textarea id="prompt" name="custom_prompt" placeholder="Ask the investigator anything…"></textarea><div class="composebar"><button class="filebtn" type="button" id="add">＋ Add</button><input class="hidden" id="binary" type="file" name="binary"><span class="filename" id="filename">no artifact attached</span><label class="chip">Runtime <select name="runtime"><option value="claude">Claude subscription</option><option value="codex">Codex subscription</option><option value="custom">Custom / API gateway</option></select></label><label class="chip">Model <select name="model"><option value="claude-opus-4-6">Claude Opus</option><option value="gpt-5">GPT-5 / Codex</option><option value="custom">Custom model</option></select></label><button class="chip" type="submit" name="mode" value="dry">Plan</button><button class="run" type="submit" name="mode" value="real" id="run">Run investigation ↗</button></div><input type="hidden" name="parallel" value="3"><div class="hint">Local-only · evidence gate required · Ctrl/Cmd + Enter to run</div></form></section></main>
+<aside class="right"><h2>Investigation context</h2><div class="card"><h3>Analysis contract</h3><div class="kv"><span>evidence gate</span><span>required</span></div><div class="kv"><span>confidence</span><span>calibrated</span></div><div class="kv"><span>data handling</span><span>local-only</span></div></div><div class="card"><h3>Capabilities</h3><span class="cap">triage</span><span class="cap">static RE</span><span class="cap">dynamic</span><span class="cap">memory</span><span class="cap">network</span><span class="cap">ATT&amp;CK</span><span class="cap">YARA</span><span class="cap">lineage</span></div><div class="card"><h3>Pipeline</h3><div class="legend">1 · triage<br>2 · static analysis<br>3 · dynamic analysis<br>4 · network analysis<br>5 · intelligence<br>6 · validate</div></div></aside>
+</div>
+<script>
+const input=document.getElementById('binary'),nameEl=document.getElementById('filename'),thread=document.getElementById('thread'),empty=document.getElementById('empty'),prompt=document.getElementById('prompt'),menu=document.getElementById('addmenu');
+const nav=document.querySelector('.nav');if(nav&&!nav.querySelector('[href="/schedule"]')){const a=document.createElement('a');a.href='/schedule';a.textContent='◷ Schedules';nav.insertBefore(a,nav.lastElementChild)}if(nav&&!nav.querySelector('[href="/settings"]')){const a=document.createElement('a');a.href='/settings';a.textContent='⚙ Settings';nav.appendChild(a)}
+const chatKey='malvex-investigator-history';let chat=JSON.parse(localStorage.getItem(chatKey)||'{"name":"New investigation","messages":[]}');document.title=chat.name+' · Malvex';
+const newLink=document.querySelector('.new');newLink.addEventListener('click',e=>{e.preventDefault();const name=window.prompt('Investigation name:', 'Malware investigation');if(name){localStorage.setItem(chatKey,JSON.stringify({name,messages:[]}));location.reload()}});
+if(chat.messages.length){empty?.remove();thread.innerHTML=chat.messages.map(x=>'<div class="msg"><div class="who">'+x.who+'</div><p>'+x.text.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))+'</p></div>').join('')}
+const activeSession=new URLSearchParams(location.search).get('session');if(activeSession){empty?.remove();const box=document.createElement('div');box.className='live-analysis';box.innerHTML='<div class="live-head"><span>Live malware investigation</span><b id="live-percent">0%</b></div><div class="live-stage" id="live-stage">Starting pipeline…</div><div class="live-track"><div class="live-fill" id="live-fill" style="width:0%"></div></div><pre class="log live-log" id="live-log">Waiting for evidence…</pre>';thread.prepend(box);const esc=s=>String(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));const refreshLive=async()=>{const r=await fetch('/api/session/'+encodeURIComponent(activeSession));if(!r.ok)return;const x=await r.json();document.getElementById('live-percent').textContent=x.percent+'%';document.getElementById('live-fill').style.width=x.percent+'%';document.getElementById('live-stage').textContent=(x.done?'Complete · ':'Running · ')+x.stage+(x.target?' · '+x.target:'');document.getElementById('live-log').textContent=(x.tail||[]).join('\n');if(!x.done)setTimeout(refreshLive,1500)};refreshLive()}
+const modelSelect=document.querySelector('select[name="model"]');if(modelSelect){modelSelect.name='models';modelSelect.multiple=true;modelSelect.title='Select multiple models; first selected is primary';modelSelect.innerHTML='<option value="claude-opus-5">Claude Opus 5</option><option value="claude-opus-4-8">Claude Opus 4.8</option><option value="claude-opus-4-6" selected>Claude Opus 4.6</option><option value="claude-sonnet-5">Claude Sonnet 5</option><option value="claude-sonnet-4-6">Claude Sonnet 4.6</option><option value="gpt-5.6-sol">GPT-5.6 Sol</option><option value="gpt-5.6-terra">GPT-5.6 Terra</option><option value="gpt-5.6-luna">GPT-5.6 Luna</option><option value="gpt-5.1-codex-max">GPT-5.1 Codex Max</option><option value="gpt-5-codex">GPT-5 Codex</option><option value="custom">Custom model ID</option>'}
+const mode=document.createElement('select');mode.name='approval_mode';mode.className='chip';mode.title='Execution approval policy';mode.innerHTML='<option value="confirm-risky">Approve risky</option><option value="auto">Auto mode</option><option value="human">Human in the loop</option>';document.querySelector('.composebar').appendChild(mode);
+const palette=document.createElement('div');palette.className='command-palette';palette.innerHTML='<button data-cmd="/clear">/clear <small>clear thread</small></button><button data-cmd="/doctor">/doctor <small>check tools and MCPs</small></button><button data-cmd="/store">/store <small>open connector and skill store</small></button><button data-cmd="/focus credential-access">/focus credential-access <small>set analysis focus</small></button>';document.querySelector('.composer').prepend(palette);prompt.addEventListener('input',()=>palette.classList.toggle('open',prompt.value.trim().startsWith('/')&&!prompt.value.includes(' ')));palette.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const c=b.dataset.cmd;if(c==='/clear'){thread.innerHTML='<div class="empty"><strong>Start an investigation</strong>Ask a question or attach an artifact.</div>'}else if(c==='/doctor'){document.getElementById('health').click()}else if(c==='/store'){location.href='/store'}else{prompt.value=c+' ';prompt.focus()}palette.classList.remove('open')});
+document.getElementById('add').addEventListener('click',()=>menu.classList.toggle('open'));
+document.getElementById('choose').addEventListener('click',()=>{menu.classList.remove('open');input.click()});
+document.getElementById('addprompt').addEventListener('click',()=>{menu.classList.remove('open');prompt.value+=(prompt.value?'\n':'')+'Next step: ' ;prompt.focus()});
+document.getElementById('terminal').addEventListener('click',()=>{menu.classList.remove('open');prompt.value='!';prompt.focus()});
+document.getElementById('health').addEventListener('click',async()=>{menu.classList.remove('open');empty?.remove();const m=document.createElement('div');m.className='msg';m.innerHTML='<div class="who">malvex doctor</div><div class="tool-results"><div class="tool-group"><h3>CHECKING…</h3></div></div>';thread.appendChild(m);const r=await fetch('/api/doctor');const data=await r.json();const groups={ready:data.filter(x=>x.present&&!x.via_mcp),mcp:data.filter(x=>x.present&&x.via_mcp),missing:data.filter(x=>!x.present)};m.querySelector('.tool-results').innerHTML=Object.entries(groups).map(([k,v])=>'<div class="tool-group"><h3>'+k.toUpperCase()+' · '+v.length+'</h3>'+v.map(x=>'<div class="tool '+(k==='missing'?'missing':'ready')+'">'+(k==='missing'?'✗':'✓')+' '+x.name+(x.via_mcp?' · MCP':'')+'</div>').join('')+'</div>').join('')});
+input.addEventListener('change',()=>{const f=input.files[0];if(f)nameEl.textContent=f.name+' · '+(f.size/1024/1024).toFixed(2)+' MB'});
+document.getElementById('composer').addEventListener('submit',async e=>{if(prompt.value.trim().startsWith('!')){e.preventDefault();empty?.remove();const command=prompt.value;const m=document.createElement('div');m.className='msg';m.innerHTML='<div class="who">terminal</div><pre class="log">Running command…</pre>';thread.appendChild(m);const r=await fetch('/terminal',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command})});const data=await r.json();m.querySelector('pre').textContent=data.output||'(no output)';chat.messages.push({who:'terminal',text:data.output||'(no output)'});localStorage.setItem(chatKey,JSON.stringify(chat));prompt.value='';return}if(!input.files.length&&!/@[^\s]+/.test(prompt.value)){e.preventDefault();prompt.focus();alert('Attach an artifact with + Add or reference one with @path/to/sample.')}else{chat.messages.push({who:'analyst',text:prompt.value});localStorage.setItem(chatKey,JSON.stringify(chat))}});
+prompt.addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)){e.preventDefault();document.getElementById('run').click()}});
+</script>
+"#;
+
+/// The upload page — a standalone hero, not the `layout()` chrome the rest of the app uses.
+/// Structure borrows Google's homepage: near-empty viewport, one centered focal widget, two
+/// unequal-weight actions under it (dry-run ≈ "Google Search", real run ≈ "I'm Feeling Lucky").
+/// The widget itself — the dark card, the yellow ring, the pink-to-violet gradient action,
+/// the rounded-pill dropzone — follows Malvex's visual language.
+#[allow(dead_code)]
+const INDEX_PAGE: &str = r#"<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Malvex</title>
+<style>
+:root{--bg:#f7f7f8;--ink:#1a1a1a;--dim:#6b6b6b;--card:#121212;--card2:#1b1b1b;
+      --gold:#ffcc33;--pink:#ff3f8e;--violet:#7c3aed;--border:#2a2a2a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 ui-sans-serif,system-ui,sans-serif;
+     min-height:100vh;display:flex;flex-direction:column}
+header{display:flex;justify-content:flex-end;padding:1.25rem 1.75rem;gap:1.5rem}
+header a{color:var(--dim);text-decoration:none;font-size:.9rem}
+header a:hover{color:var(--ink)}
+main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+     padding:2rem 1.25rem 6rem;text-align:center}
+.wordmark{font-size:2.6rem;font-weight:800;letter-spacing:-.02em;margin:0 0 .35rem;
+          display:flex;align-items:center;gap:.6rem;justify-content:center}
+.wordmark .dot{width:.55em;height:.55em;border-radius:50%;
+    background:radial-gradient(circle at 35% 30%,#fff3c4,var(--gold) 60%);
+    box-shadow:0 0 22px 4px rgba(255,204,51,.55)}
+.tag{color:var(--dim);margin:0 0 2.25rem;font-size:.95rem;max-width:34rem}
+.card{position:relative;width:min(92vw,560px);background:var(--card);border-radius:20px;
+      padding:2.25rem 2rem 1.9rem;box-shadow:0 20px 50px -20px rgba(0,0,0,.35);
+      border:1px solid #232323;isolation:isolate;overflow:hidden}
+.card::before{content:"";position:absolute;inset:-40% -20% auto auto;width:70%;height:140%;
+      background:radial-gradient(circle,rgba(255,204,51,.20),transparent 60%);z-index:-1}
+.card::after{content:"";position:absolute;inset:auto auto -50% -20%;width:60%;height:120%;
+      background:radial-gradient(circle,rgba(255,63,142,.16),transparent 60%);z-index:-1}
+.drop{display:block;position:relative;border:1.5px dashed #3a3a3a;border-radius:16px;
+      padding:2rem 1rem;cursor:pointer;transition:border-color .15s,background .15s;color:#e8e8e8}
+.drop:hover,.drop.over{border-color:var(--gold);background:#181818}
+.drop input{position:absolute;top:0;left:0;width:1px;height:1px;opacity:0;overflow:hidden}
+.drop .icon{width:44px;height:44px;margin:0 auto .8rem;border-radius:50%;
+      background:linear-gradient(135deg,var(--gold),var(--pink));
+      display:flex;align-items:center;justify-content:center;font-size:1.3rem}
+.drop .fname{display:block;margin-top:.6rem;font-size:.85rem;color:var(--gold);word-break:break-all}
+.drop .hint{display:block;color:#8a8a8a;font-size:.82rem;margin-top:.25rem}
+.parallel-row{display:flex;align-items:center;justify-content:center;gap:.6rem;
+      margin-top:1.1rem;color:#b8b8b8;font-size:.85rem}
+.parallel-row select{background:#1e1e1e;color:#e8e8e8;border:1px solid #333;border-radius:8px;
+      padding:.3rem .6rem;font:inherit;font-size:.9rem;cursor:pointer}
+.prompt-row{display:block;text-align:left;margin-top:1rem;color:#b8b8b8;font-size:.85rem}
+.prompt-row textarea{width:100%;margin-top:.4rem;background:#1e1e1e;color:#e8e8e8;
+      border:1px solid #333;border-radius:10px;padding:.6rem .7rem;font:inherit;font-size:.85rem;
+      resize:vertical;box-sizing:border-box}
+.prompt-row textarea:focus{outline:none;border-color:var(--gold)}
+.actions{display:flex;gap:.75rem;justify-content:center;margin-top:1.5rem;flex-wrap:wrap}
+button{font:inherit;font-size:.92rem;font-weight:600;border-radius:999px;padding:.65rem 1.5rem;
+       cursor:pointer;transition:transform .1s,box-shadow .15s}
+button:active{transform:scale(.97)}
+.btn-ghost{background:#1e1e1e;color:#e8e8e8;border:1px solid #333}
+.btn-ghost:hover{border-color:#555}
+.btn-main{background:linear-gradient(135deg,var(--pink),var(--violet));color:#fff;border:0;
+          box-shadow:0 8px 24px -8px rgba(255,63,142,.55)}
+.btn-main:hover{box-shadow:0 10px 28px -6px rgba(255,63,142,.7)}
+button:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}
+.note{color:var(--dim);font-size:.82rem;margin-top:1.5rem;max-width:26rem}
+.note a{color:inherit}
+footer{padding:1.25rem;text-align:center;color:#a5a5a5;font-size:.8rem}
+</style>
+<header><a href="/sessions">sessions</a></header>
+<main>
+  <h1 class=wordmark>Malvex<span class=dot></span></h1>
+  <p class=tag>Envie uma amostra PE / ELF / Mach-O / script / installer — a plataforma faz triagem,
+  RE, análise dinâmica, inteligência e validação orientadas por evidência.</p>
+  <form class=card action="/upload" method="post" enctype="multipart/form-data" id=f>
+    <label class=drop id=drop for=file>
+      <span class=icon>⇪</span>
+      <span id=label>arraste o binário aqui, ou clique pra escolher</span>
+      <span class=fname id=fname></span>
+      <span class=hint>.exe · .dll · .sys · .elf · .so · .dylib · .app · script · installer</span>
+      <input id=file type=file name=binary required/>
+    </label>
+    <label class=parallel-row for=parallel>
+      Agentes paralelos por estágio
+      <select id=parallel name=parallel>
+        <option value=1 selected>1</option>
+        <option value=2>2</option>
+        <option value=3>3</option>
+        <option value=4>4</option>
+        <option value=5>5</option>
+      </select>
+    </label>
+    <label class=prompt-row for=custom_prompt>
+      Contexto / instruções pro analista (opcional)
+      <textarea id=custom_prompt name=custom_prompt rows=3
+        placeholder="ex: foca no mecanismo de update; assuma atacante com acesso físico ao device; esse build não tem CEF, ignora vetores de web frontend..."></textarea>
+    </label>
+    <div class=actions>
+      <button class=btn-ghost type=submit name=mode value=dry id=btn-dry disabled>Planejar análise</button>
+      <button class=btn-main type=submit name=mode value=real id=btn-real disabled>Iniciar análise</button>
+    </div>
+  </form>
+  <p class=note>Dry-run só imprime o plano. Iniciar análise dispara a esteira de triage,
+  análise estática, dinâmica, inteligência e validação em background — acompanhe em
+  <a href="/sessions">sessions</a>. Máximo 5 agentes paralelos por estágio — acima disso o
+  ganho cai e sobe o risco de saturar runtime, API ou tooling local.</p>
+</main>
+<footer>Malvex · AI Reverse Engineering Harness</footer>
+<script>
+const inp=document.getElementById('file'),drop=document.getElementById('drop'),
+      label=document.getElementById('label'),fname=document.getElementById('fname'),
+      bd=document.getElementById('btn-dry'),br=document.getElementById('btn-real');
+function chosen(f){
+  if(!f){return}
+  label.textContent='arquivo selecionado:';
+  fname.textContent=f.name;
+  bd.disabled=false; br.disabled=false;
+}
+inp.addEventListener('change',()=>chosen(inp.files[0]));
+['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over')}));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('over')}));
+drop.addEventListener('drop',e=>{
+  if(e.dataTransfer.files.length){inp.files=e.dataTransfer.files;chosen(inp.files[0])}
+});
+</script>
+"#;
+
+async fn upload(State(st): State<Arc<AppState>>, mut mp: Multipart) -> Response {
+    let mut saved: Option<PathBuf> = None;
+    let mut real = false;
+    // Mirrors malvex-cli's own MAX_PARALLEL clamp (1-5) — enforced here too since a request
+    // could reach this handler directly (curl, a stale form) bypassing the <select>'s options.
+    let mut parallel: usize = 1;
+    let mut custom_prompt: Option<String> = None;
+    let mut approval_mode = "confirm-risky".to_string();
+    let mut model = "claude-opus-4-6".to_string();
+    let mut fallback_models: Vec<String> = Vec::new();
+    let mut runtime = "claude".to_string();
+    // Real malware-analysis targets (.app bundles, .msi installers, fat samples) routinely run tens to hundreds of
+    // MB — well past axum's default 2MB body limit (raised on the /upload route below, but
+    // this loop still has to report WHY nothing was saved instead of silently falling through
+    // to a generic "no file received", which is what made an oversized/interrupted upload
+    // indistinguishable from just forgetting to pick a file.
+    let mut error: Option<String> = None;
+    loop {
+        match mp.next_field().await {
+            Ok(Some(field)) => match field.name().unwrap_or("") {
+                "mode" => {
+                    real = field.text().await.map(|v| v == "real").unwrap_or(false);
+                }
+                "parallel" => {
+                    parallel = field
+                        .text()
+                        .await
+                        .ok()
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(1)
+                        .clamp(1, 5);
+                }
+                "custom_prompt" => {
+                    let text = field.text().await.unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        custom_prompt = Some(text);
+                    }
+                }
+                "model" => {
+                    model = field.text().await.unwrap_or_default();
+                    if model.trim().is_empty() { model = "claude-opus-4-6".to_string(); }
+                }
+                "runtime" => {
+                    runtime = field.text().await.unwrap_or_default();
+                    if runtime.trim().is_empty() { runtime = "claude".to_string(); }
+                }
+                "models" => {
+                    let selected = field.text().await.unwrap_or_default();
+                    if !selected.trim().is_empty() {
+                        if model == "claude-opus-4-6" && fallback_models.is_empty() { model = selected; }
+                        else { fallback_models.push(selected); }
+                    }
+                }
+                "approval_mode" => {
+                    let value = field.text().await.unwrap_or_default();
+                    if matches!(value.as_str(), "auto" | "confirm-risky" | "human") { approval_mode = value; }
+                }
+                "binary" => {
+                    let fname = field.file_name().unwrap_or("upload.bin").to_string();
+                    let safe = fname.replace(['/', '\\', ' '], "_");
+                    let dest = st.uploads.join(&safe);
+                    match field.bytes().await {
+                        Ok(bytes) if !bytes.is_empty() => match std::fs::write(&dest, &bytes) {
+                            Ok(()) => saved = Some(dest),
+                            Err(e) => error = Some(format!("failed to write upload to disk: {e}")),
+                        },
+                        Ok(_) => error = Some("received an empty file".to_string()),
+                        Err(e) => {
+                            error = Some(format!(
+                                "upload stream failed while reading the file — likely too large \
+                                 for the current body-size limit: {e}"
+                            ))
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Ok(None) => break,
+            Err(e) => {
+                error = Some(format!(
+                    "multipart parsing failed — likely too large for the current body-size \
+                     limit: {e}"
+                ));
+                break;
+            }
+        }
+    }
+
+    let saved = saved.or_else(|| {
+        let prompt = custom_prompt.as_deref()?;
+        let root = std::fs::canonicalize(&st.root).ok()?;
+        prompt.split_whitespace().find_map(|token| {
+            let raw = token.strip_prefix('@')?.trim_matches(['`', '"', '\'', ',', ')', ']']);
+            if raw.is_empty() { return None; }
+            let candidate = FsPath::new(raw);
+            let candidate = if candidate.is_absolute() { candidate.to_path_buf() } else { root.join(candidate) };
+            let canonical = std::fs::canonicalize(candidate).ok()?;
+            if canonical.is_file() && canonical.starts_with(&root) { Some(canonical) } else { None }
+        })
+    });
+    let Some(path) = saved else {
+        let msg = error.unwrap_or_else(|| "no file field in the submitted form".to_string());
+        let body = format!(
+            "<div class=card><p>upload failed: {}</p></div><a class=btn href=\"/\">back</a>",
+            html_escape(&msg)
+        );
+        return layout("upload", "/", &body).into_response();
+    };
+
+    let bin = st.root.join("target/release/malvex");
+    if !bin.is_file() {
+        let msg = format!(
+            "<div class=card><p>malvex binary not found at <code>{}</code> — build it first: \
+             <code>cargo build --release -p malvex-cli</code></p></div><a class=btn href=\"/\">back</a>",
+            html_escape(&bin.display().to_string())
+        );
+        return layout("upload", "/", &msg).into_response();
+    }
+
+    if !real {
+        // Dry-run: fast, synchronous, just prints the plan.
+        let mut cmd = tokio::process::Command::new(&bin);
+        cmd.arg("run").arg(&path).arg("--root").arg(&st.root).arg("--dry-run")
+            .arg("--parallel").arg(parallel.to_string())
+            .arg("--model").arg(&model).arg("--runtime").arg(&runtime)
+            .arg("--fallback-models").arg(fallback_models.join(","))
+            .arg("--approval-mode").arg(&approval_mode);
+        if let Some(p) = &custom_prompt {
+            cmd.arg("--prompt").arg(p);
+        }
+        let out = cmd.output().await;
+        let body_text = match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Err(e) => format!("pipeline invocation failed: {e}"),
+        };
+        let body = format!(
+            "<h2>Pipeline plan — {}</h2><p class=dim>mode: dry-run (plan only)</p>\
+             <pre class=log>{}</pre><a class=\"btn ghost\" href=\"/\">&larr; analyze another</a>",
+            html_escape(&path.file_name().unwrap_or_default().to_string_lossy()),
+            html_escape(&body_text)
+        );
+        return layout("plan", "/", &body).into_response();
+    }
+
+    // Real mode: launch genuinely detached — the analysis can run for hours, well past any
+    // single malvex-web process lifetime (a redeploy, a crash, a manual restart while iterating
+    // on this very file all happened during testing and silently killed running sessions).
+    //
+    // The previous version piped the child's stdout/stderr back into THIS process and read
+    // them here (to catch the "SESSION: <id>" startup banner, then a background task drained
+    // the rest to keep the pipe from filling). That made the child's survival depend on this
+    // process staying alive: a pipe's read end is a file descriptor owned by the reading
+    // process, so the moment malvex-web exits, that fd closes, the child's next stdout write
+    // gets EPIPE, and — since neither `malvex` nor the local runtime necessarily install a custom SIGPIPE handler —
+    // the default disposition for SIGPIPE terminates the process outright. No crash log, no
+    // stderr, no error status: the stage that was running (once seen stuck on `validate` for
+    // hours with an AGENT_START and no AGENT_DONE) just stopped mid-write, orphaned.
+    //
+    // Fix: redirect stdout/stderr straight to real files on disk at spawn time. Those file
+    // descriptors are owned by the KERNEL's open-file table, not by this process — once
+    // spawned, the child is fully independent of whether malvex-web is even still running.
+    // We recover the session id by polling the log file for the banner instead of blocking
+    // on a pipe read; no in-process draining task is needed since the OS handles the rest.
+    let log_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stdout_path = st.uploads.join(format!("pipeline-{log_id}.stdout.log"));
+    let stderr_path = st.uploads.join(format!("pipeline-{log_id}.stderr.log"));
+    let stdout_file = match std::fs::File::create(&stdout_path) {
+        Ok(f) => f,
+        Err(e) => {
+            let msg = format!("<div class=card><p>failed to create pipeline log file: {}</p></div><a class=btn href=\"/\">back</a>", html_escape(&e.to_string()));
+            return layout("upload", "/", &msg).into_response();
+        }
+    };
+    let stderr_file = match std::fs::File::create(&stderr_path) {
+        Ok(f) => f,
+        Err(e) => {
+            let msg = format!("<div class=card><p>failed to create pipeline log file: {}</p></div><a class=btn href=\"/\">back</a>", html_escape(&e.to_string()));
+            return layout("upload", "/", &msg).into_response();
+        }
+    };
+
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("run").arg(&path).arg("--root").arg(&st.root)
+        .arg("--parallel").arg(parallel.to_string())
+        .arg("--model").arg(&model).arg("--runtime").arg(&runtime)
+        .arg("--fallback-models").arg(fallback_models.join(","))
+        .arg("--approval-mode").arg(&approval_mode);
+    if let Some(p) = &custom_prompt {
+        cmd.arg("--prompt").arg(p);
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::from(stdout_file));
+    cmd.stderr(std::process::Stdio::from(stderr_file));
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("<div class=card><p>failed to launch pipeline: {}</p></div><a class=btn href=\"/\">back</a>", html_escape(&e.to_string()));
+            return layout("upload", "/", &msg).into_response();
+        }
+    };
+    let pid = child.id();
+    // Don't hold the Child (and its stdio handles) hostage to this request's lifetime — drop
+    // it explicitly. The process itself is already independent (real file stdio); tokio's
+    // runtime reaps it in the background regardless, as long as this server process is up
+    // when it exits, which is the common case and not required for the child to keep running.
+    drop(child);
+
+    let mut sid: Option<String> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(contents) = tokio::fs::read_to_string(&stdout_path).await {
+            if let Some(line) = contents.lines().find_map(|l| l.strip_prefix("║  SESSION:")) {
+                sid = Some(line.trim_end_matches('║').trim().to_string());
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // Now that the session dir exists (the orchestrator creates it and writes target.json
+    // before printing the banner), drop a PID lock into it so session_detail() can tell a
+    // genuinely still-running session apart from one that stopped/crashed — the whole reason
+    // this feature exists is that a session sitting on a stage for hours looks IDENTICAL from
+    // session.log alone (an AGENT_START with no AGENT_DONE) whether the process is grinding
+    // away or has been dead for hours.
+    if let (Some(pid), Some(id)) = (pid, &sid) {
+        write_pid_lock(&st.root.join("sessions").join(id), pid);
+    }
+
+    match sid {
+        Some(id) => Redirect::to(&format!("/?session={id}")).into_response(),
+        None => {
+            let msg = format!(
+                "<div class=card><p>pipeline started but never printed its session banner \
+                 within 30s — check the configured runtime, target path, and the launch logs at \
+                 Raw output: <code>{}</code></p></div><a class=btn href=\"/\">back</a>",
+                html_escape(&stdout_path.display().to_string())
+            );
+            layout("upload", "/", &msg).into_response()
+        }
+    }
+}
+
+// ── Sessions dashboard ───────────────────────────────────────────────────────
+
+struct SessionRow {
+    id: String,
+    app: String,
+    format: String,
+    version: Option<String>,
+    total: usize,
+    confirmed: usize,
+    crit_high: usize,
+    done: bool,
+}
+
+/// Best-effort version of the analyzed artifact itself (not the Malvex tool), so the dashboard says which build was actually
+/// audited. Tries every format this framework targets, cheapest/most-reliable first, all
+/// straight off the target's own path (still on disk from when the session ran — target.json
+/// never captured this, so it has to be re-derived, not just read back):
+///   1. macOS .app bundle       → `plutil` reads Info.plist (CFBundleShortVersionString).
+///   2. MSI installer           → `msiinfo export … Property` (ProductVersion row).
+///   3. PE .exe/.dll            → self-parsed RT_VERSION resource (VS_FIXEDFILEINFO) — no
+///      external tool assumed installed (exiftool/lief are both optional on the analyst
+///      machine, and in practice miss plenty of real PEs); walking the resource directory
+///      by hand works on anything with a version resource.
+///   4. Filename fallback       → a trailing `-1.2.3` / `_v1.2.3` in the file name, for
+///      whatever's left (raw ELF, stripped PE, anything else) — weaker signal, last resort.
+fn artifact_version(target: &Target) -> Option<String> {
+    if let Some(idx) = target.path.find(".app/") {
+        if let Some(v) = macos_bundle_version(&target.path[..idx + 4]) {
+            return Some(v);
+        }
+    }
+    let lower = target.path.to_lowercase();
+    if target.format == "installer" || lower.ends_with(".msi") {
+        if let Some(v) = msi_version(&target.path) {
+            return Some(v);
+        }
+    }
+    if target.format == "pe" || lower.ends_with(".exe") || lower.ends_with(".dll") || lower.ends_with(".sys") {
+        if let Ok(bytes) = std::fs::read(&target.path) {
+            if let Some(v) = pe_version(&bytes) {
+                return Some(v);
+            }
+        }
+    }
+    filename_version(&target.path)
+}
+
+fn macos_bundle_version(bundle: &str) -> Option<String> {
+    let plist = format!("{bundle}/Contents/Info.plist");
+    if !FsPath::new(&plist).is_file() {
+        return None;
+    }
+    let out = std::process::Command::new("plutil")
+        .args(["-convert", "json", "-o", "-", &plist])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let short = json.get("CFBundleShortVersionString").and_then(|v| v.as_str());
+    let build = json.get("CFBundleVersion").and_then(|v| v.as_str());
+    match (short, build) {
+        (Some(s), Some(b)) if s != b => Some(format!("{s} ({b})")),
+        (Some(s), _) => Some(s.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// `msiinfo export <msi> Property` dumps the MSI Property table as tab-separated
+/// `name\tvalue` lines — ProductVersion is a mandatory column in every valid MSI. Note this
+/// can legitimately disagree with the filename's version (seen on real-world MSIs in this
+/// corpus) — that mismatch is itself worth surfacing, not a reason to prefer the filename.
+fn msi_version(path: &str) -> Option<String> {
+    let out = std::process::Command::new("msiinfo").args(["export", path, "Property"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines().find_map(|l| l.strip_prefix("ProductVersion\t")).map(|v| v.trim().to_string())
+}
+
+/// A trailing `-1.2.3`, `_v1.2.3.4`, or `.1.2.3` in the file name — the weakest signal, but
+/// installers/artifacts in this framework's own corpus are routinely named exactly
+/// this way, so it's a real fallback, not a theoretical one.
+fn filename_version(path: &str) -> Option<String> {
+    let name = FsPath::new(path).file_stem()?.to_str()?;
+    let bytes = name.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] != b'-' && bytes[i] != b'_' && bytes[i] != b'.' {
+            continue;
+        }
+        let rest = &name[i + 1..];
+        let digits_and_dots: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let looks_versioned = digits_and_dots.contains('.')
+            && digits_and_dots.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && digits_and_dots.chars().last().is_some_and(|c| c.is_ascii_digit());
+        if looks_versioned {
+            return Some(digits_and_dots);
+        }
+    }
+    None
+}
+
+// ── PE VERSIONINFO parsing (self-contained — no exiftool/lief dependency assumed) ───────────
+// Walks IMAGE_RESOURCE_DIRECTORY (type RT_VERSION=16 -> name -> language) to the raw
+// VS_VERSIONINFO block, then reads the fixed-size VS_FIXEDFILEINFO struct that always follows
+// the "VS_VERSION_INFO" key string — the numeric FileVersion, no StringFileInfo table needed.
+// Version extraction is intentionally format-native and independent of vendor naming.
+
+fn u16le(b: &[u8], off: usize) -> Option<u16> {
+    b.get(off..off + 2).map(|s| u16::from_le_bytes([s[0], s[1]]))
+}
+fn u32le(b: &[u8], off: usize) -> Option<u32> {
+    b.get(off..off + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+struct PeSection {
+    va: u32,
+    vsize: u32,
+    praw: u32,
+}
+
+fn rva_to_offset(sections: &[PeSection], rva: u32) -> Option<usize> {
+    sections
+        .iter()
+        .find(|s| rva >= s.va && rva < s.va + s.vsize.max(1))
+        .map(|s| (rva - s.va + s.praw) as usize)
+}
+
+/// First entry in an IMAGE_RESOURCE_DIRECTORY at `dir_off` matching numeric `id` (checked only
+/// against the ID-type entries, i.e. past the named ones) — or, with `id: None`, simply the
+/// first entry of either kind (used once we're past the RT_VERSION type level, where we just
+/// want whichever name/language is there). Returns the raw OffsetToData/Directory field
+/// (high bit set = points to another subdirectory, relative to the resource section root).
+fn pe_first_entry(bytes: &[u8], dir_off: usize, id: Option<u32>) -> Option<u32> {
+    let named = u16le(bytes, dir_off + 12)? as usize;
+    let ided = u16le(bytes, dir_off + 14)? as usize;
+    let entries_off = dir_off + 16;
+    for i in 0..(named + ided) {
+        let e = entries_off + i * 8;
+        let name_or_id = u32le(bytes, e)?;
+        let offset = u32le(bytes, e + 4)?;
+        match id {
+            Some(want) if i >= named && name_or_id == want => return Some(offset),
+            None => return Some(offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn pe_version(bytes: &[u8]) -> Option<String> {
+    const RT_VERSION: u32 = 16;
+    const VS_FFI_SIGNATURE: u32 = 0xFEEF_04BD;
+
+    let e_lfanew = u32le(bytes, 0x3C)? as usize;
+    if bytes.get(e_lfanew..e_lfanew + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let coff = e_lfanew + 4;
+    let num_sections = u16le(bytes, coff + 2)? as usize;
+    let size_opt_hdr = u16le(bytes, coff + 16)? as usize;
+    let opt_off = coff + 20;
+    let dd_off = match u16le(bytes, opt_off)? {
+        0x10b => opt_off + 96,  // PE32
+        0x20b => opt_off + 112, // PE32+
+        _ => return None,
+    };
+    let res_rva = u32le(bytes, dd_off + 2 * 8)?; // data directory[2] = resource table
+    if res_rva == 0 {
+        return None;
+    }
+
+    let sec_table_off = opt_off + size_opt_hdr;
+    let mut sections = Vec::with_capacity(num_sections);
+    for i in 0..num_sections {
+        let s = sec_table_off + i * 40;
+        sections.push(PeSection {
+            va: u32le(bytes, s + 12)?,
+            vsize: u32le(bytes, s + 8)?,
+            praw: u32le(bytes, s + 20)?,
+        });
+    }
+    let res_base = rva_to_offset(&sections, res_rva)?;
+
+    let type_entry = pe_first_entry(bytes, res_base, Some(RT_VERSION))?;
+    let name_dir = res_base + (type_entry & 0x7fff_ffff) as usize;
+    if type_entry & 0x8000_0000 == 0 {
+        return None;
+    }
+    let name_entry = pe_first_entry(bytes, name_dir, None)?;
+    if name_entry & 0x8000_0000 == 0 {
+        return None;
+    }
+    let lang_dir = res_base + (name_entry & 0x7fff_ffff) as usize;
+    let lang_entry = pe_first_entry(bytes, lang_dir, None)?;
+    if lang_entry & 0x8000_0000 != 0 {
+        return None; // expected a leaf (data entry) here, not another subdirectory
+    }
+    let data_entry_off = res_base + lang_entry as usize;
+    let data_off = rva_to_offset(&sections, u32le(bytes, data_entry_off)?)?;
+
+    // VS_VERSIONINFO: wLength(2) wValueLength(2) wType(2) L"VS_VERSION_INFO\0" (32 bytes),
+    // padded to 4 bytes, then VS_FIXEDFILEINFO.
+    let value_len = u16le(bytes, data_off + 2)?;
+    if value_len == 0 {
+        return None;
+    }
+    let fixed_off = (data_off + 6 + 32 + 3) & !3;
+    if u32le(bytes, fixed_off)? != VS_FFI_SIGNATURE {
+        return None;
+    }
+    let ms = u32le(bytes, fixed_off + 8)?;
+    let ls = u32le(bytes, fixed_off + 12)?;
+    Some(format!("{}.{}.{}.{}", ms >> 16, ms & 0xffff, ls >> 16, ls & 0xffff))
+}
+
+fn list_sessions(root: &FsPath) -> Vec<SessionRow> {
+    let dir = root.join("sessions");
+    let mut rows = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&dir) else { return rows };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let id = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let target: Option<Target> = std::fs::read_to_string(p.join("target.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok());
+        let findings: Vec<Finding> = std::fs::read_to_string(p.join("findings.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let confirmed = findings.iter().filter(|f| f.verdict == Verdict::Confirmed).count();
+        let crit_high = findings
+            .iter()
+            .filter(|f| matches!(f.severity, Severity::Critical | Severity::High))
+            .count();
+        let done = std::fs::read_to_string(p.join("session.log"))
+            .map(|l| l.contains("SESSION_DONE"))
+            .unwrap_or(false);
+        rows.push(SessionRow {
+            id,
+            app: target.as_ref().map(|t| t.app.clone()).unwrap_or_else(|| "?".into()),
+            format: target.as_ref().map(|t| t.format.clone()).unwrap_or_default(),
+            version: target.as_ref().and_then(artifact_version),
+            total: findings.len(),
+            confirmed,
+            crit_high,
+            done,
+        });
+    }
+    rows.sort_by_key(|r| std::cmp::Reverse(r.id.parse::<u64>().unwrap_or(0)));
+    rows
+}
+
+async fn sessions_dashboard(State(st): State<Arc<AppState>>) -> Html<String> {
+    let rows = list_sessions(&st.root);
+    let table_rows: String = if rows.is_empty() {
+        "<tr><td colspan=8 class=dim>no sessions yet — analyze a binary from the upload page</td></tr>".into()
+    } else {
+        rows.iter()
+            .map(|r| {
+                let status = if r.done {
+                    "<span class=\"badge b-done\">done</span>"
+                } else {
+                    "<span class=\"badge b-run\">running</span>"
+                };
+                let version = r
+                    .version
+                    .as_deref()
+                    .map(html_escape)
+                    .unwrap_or_else(|| "<span class=dim>—</span>".into());
+                format!(
+                    "<tr><td><a href=\"/session/{id}\">{id}</a></td><td>{app}</td><td>{fmt}</td>\
+                     <td>{version}</td><td>{total}</td><td>{confirmed}</td><td>{crit}</td><td>{status}</td></tr>",
+                    id = html_escape(&r.id),
+                    app = html_escape(&r.app),
+                    fmt = html_escape(&r.format),
+                    version = version,
+                    total = r.total,
+                    confirmed = r.confirmed,
+                    crit = r.crit_high,
+                    status = status,
+                )
+            })
+            .collect()
+    };
+    let body = format!(
+        "<h1>Sessions</h1>\
+         <div class=card><div class=scroll><table>\
+         <tr><th>id</th><th>app</th><th>format</th><th>version</th><th>findings</th><th>confirmed</th>\
+         <th>crit/high</th><th>status</th></tr>{table_rows}</table></div></div>"
+    );
+    layout("sessions", "/sessions", &body)
+}
+
+// ── Session detail ───────────────────────────────────────────────────────────
+
+const STAGES: &[&str] = &["triage", "static", "dynamic", "network", "intelligence", "validate"];
+
+struct Progress {
+    stage_status: Vec<(String, &'static str)>,
+    session_done: bool,
+    tail: Vec<String>,
+}
+
+fn kv(line: &str, key: &str) -> Option<String> {
+    for part in line.split(" | ") {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix(key).and_then(|r| r.strip_prefix('=')) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn read_progress(session_dir: &FsPath) -> Progress {
+    let log = std::fs::read_to_string(session_dir.join("session.log")).unwrap_or_default();
+    let mut stage_status: Vec<(String, &'static str)> =
+        STAGES.iter().map(|s| (s.to_string(), "pending")).collect();
+    let mut session_done = false;
+
+    for line in log.lines() {
+        if line.contains("STAGE_START") {
+            if let Some(name) = kv(line, "stage") {
+                if let Some(e) = stage_status.iter_mut().find(|(n, _)| *n == name) {
+                    e.1 = "running";
+                }
+            }
+        }
+        if line.contains("STAGE_DONE") || line.contains("STAGE_SKIP") {
+            if let Some(name) = kv(line, "stage") {
+                if let Some(e) = stage_status.iter_mut().find(|(n, _)| *n == name) {
+                    e.1 = "done";
+                }
+            }
+        }
+        if line.contains("SESSION_DONE") {
+            session_done = true;
+        }
+    }
+
+    let tail: Vec<String> = {
+        let mut v: Vec<String> = log.lines().rev().take(25).map(|s| s.to_string()).collect();
+        v.reverse();
+        v
+    };
+
+    Progress { stage_status, session_done, tail }
+}
+
+fn severity_badge(s: Severity) -> &'static str {
+    match s {
+        Severity::Critical => "b-crit",
+        Severity::High => "b-high",
+        Severity::Medium => "b-med",
+        Severity::Low => "b-low",
+        Severity::Info => "b-info",
+    }
+}
+
+fn verdict_badge(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Confirmed => "b-confirmed",
+        Verdict::Plausible => "b-plausible",
+        Verdict::Refuted => "b-refuted",
+        Verdict::Pending => "b-pending",
+    }
+}
+
+/// Reject anything that isn't a plain session-id-shaped path component (numeric or `word`
+/// chars only) before it ever touches the filesystem — session ids come straight from the
+/// URL, so this is the only thing standing between a request and `../../etc/passwd`.
+fn safe_component(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Re-invoke `malvex run --resume` for a session that isn't done and has no live PID lock.
+/// Same fully-detached spawn as upload()'s real mode (file-backed stdio, PID lock written
+/// immediately) — the only difference is the session dir and target path are already known,
+/// so there's no banner to wait for; redirect straight back to the (now live again) detail
+/// page.
+async fn resume_session(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if !safe_component(&id) {
+        return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
+    }
+    let session_dir = st.root.join("sessions").join(&id);
+    if !session_dir.is_dir() {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    }
+    let target: Option<Target> = std::fs::read_to_string(session_dir.join("target.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let Some(target) = target else {
+        let msg = "<div class=card><p>no target.json in this session — nothing to resume.</p></div>\
+                   <a class=btn href=\"/sessions\">back</a>";
+        return layout("session", "/sessions", msg).into_response();
+    };
+
+    // Check the lock first; for a session that predates this feature (no lock file yet),
+    // fall back to searching live processes by target path before trusting "nothing is
+    // running" — see find_and_lock_live_pid's doc comment for why this fallback exists.
+    let live = read_pid_lock(&session_dir)
+        .filter(|&pid| process_alive(pid))
+        .or_else(|| find_and_lock_live_pid(&session_dir, &target.path));
+    if let Some(pid) = live {
+        let msg = format!(
+            "<div class=card><p>refusing to resume — PID {pid} is already running for this \
+             session. Starting a second run against the same session dir would race on \
+             findings.json/session.log.</p></div><a class=btn href=\"/session/{id}\">back</a>"
+        );
+        return layout("session", "/sessions", &msg).into_response();
+    }
+
+    let bin = st.root.join("target/release/malvex");
+    let log_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let stdout_path = session_dir.join(format!("resume-{log_id}.stdout.log"));
+    let stderr_path = session_dir.join(format!("resume-{log_id}.stderr.log"));
+    let (Ok(stdout_file), Ok(stderr_file)) =
+        (std::fs::File::create(&stdout_path), std::fs::File::create(&stderr_path))
+    else {
+        let msg = "<div class=card><p>failed to create resume log files.</p></div>\
+                   <a class=btn href=\"/sessions\">back</a>";
+        return layout("session", "/sessions", msg).into_response();
+    };
+
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("run").arg(&target.path).arg("--root").arg(&st.root).arg("--resume").arg(&session_dir);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::from(stdout_file));
+    cmd.stderr(std::process::Stdio::from(stderr_file));
+    match cmd.spawn() {
+        Ok(child) => {
+            if let Some(pid) = child.id() {
+                write_pid_lock(&session_dir, pid);
+            }
+            drop(child);
+            Redirect::to(&format!("/session/{id}")).into_response()
+        }
+        Err(e) => {
+            let msg = format!(
+                "<div class=card><p>failed to launch resume: {}</p></div><a class=btn href=\"/session/{id}\">back</a>",
+                html_escape(&e.to_string())
+            );
+            layout("session", "/sessions", &msg).into_response()
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SessionProgressResponse {
+    id: String,
+    target: String,
+    stage: String,
+    percent: usize,
+    done: bool,
+    stages: Vec<(String, String)>,
+    tail: Vec<String>,
+}
+
+async fn api_session(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if !safe_component(&id) {
+        return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
+    }
+    let dir = st.root.join("sessions").join(&id);
+    if !dir.is_dir() {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    }
+    let progress = read_progress(&dir);
+    let done_stages = progress.stage_status.iter().filter(|(_, s)| *s == "done").count();
+    let percent = if progress.session_done { 100 } else {
+        done_stages * 100 / progress.stage_status.len().max(1)
+    };
+    let stage = progress.stage_status.iter().find(|(_, s)| *s == "running")
+        .map(|(n, _)| n.clone())
+        .unwrap_or_else(|| if progress.session_done { "complete".into() } else { "queued".into() });
+    let target = std::fs::read_to_string(dir.join("target.json")).ok()
+        .and_then(|s| serde_json::from_str::<Target>(&s).ok())
+        .map(|t| t.path).unwrap_or_default();
+    Json(SessionProgressResponse {
+        id, target, stage, percent, done: progress.session_done,
+        stages: progress.stage_status.into_iter().map(|(n, s)| (n, s.to_string())).collect(),
+        tail: progress.tail,
+    }).into_response()
+}
+
+async fn session_detail(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if !safe_component(&id) {
+        return (StatusCode::BAD_REQUEST, "invalid session id").into_response();
+    }
+    let session_dir = st.root.join("sessions").join(&id);
+    if !session_dir.is_dir() {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    }
+
+    let target: Option<Target> = std::fs::read_to_string(session_dir.join("target.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let mut findings: Vec<Finding> = std::fs::read_to_string(session_dir.join("findings.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    findings.sort_by(|a, b| b.severity.cmp(&a.severity));
+
+    let progress = read_progress(&session_dir);
+
+    let target_block = match &target {
+        Some(t) => format!(
+            "<p><b>{}</b>{} — {} / {} {}</p>\
+             <p class=dim>{}</p>",
+            html_escape(&t.app),
+            artifact_version(t).map(|v| format!(" <span class=dim>v{}</span>", html_escape(&v))).unwrap_or_default(),
+            html_escape(&t.format),
+            html_escape(&t.arch),
+            if t.shielding.is_empty() { String::new() } else { format!("· shielding: {}", html_escape(&t.shielding.join(", "))) },
+            html_escape(&t.path),
+        ),
+        None => "<p class=dim>target.json not found yet</p>".into(),
+    };
+
+    let stage_bar: String = progress
+        .stage_status
+        .iter()
+        .map(|(name, status)| format!("<span class=\"stage {status}\">{name}</span>"))
+        .collect();
+    let done_stages = progress.stage_status.iter().filter(|(_, status)| *status == "done").count();
+    let active_stage = progress.stage_status.iter().find(|(_, status)| *status == "running").map(|(name, _)| name.as_str()).unwrap_or("queued");
+    let percent = if progress.session_done { 100 } else { (done_stages * 100) / progress.stage_status.len().max(1) };
+    let progress_block = format!("<div class=progress-head><span>Pipeline progress · {active_stage}</span><b>{percent}%</b></div><div class=progress-track><div class=progress-fill style=\"width:{percent}%\"></div></div>");
+
+    // Ground "running" in an actual OS-level liveness check (PID lock + `kill -0`), not just
+    // "session.log doesn't say SESSION_DONE yet" — that guess is exactly what made a session
+    // sitting on a stage for hours look identical whether the process was genuinely still
+    // working or had been dead for hours with nobody able to tell from the browser.
+    let live_pid = read_pid_lock(&session_dir)
+        .filter(|&pid| process_alive(pid))
+        .or_else(|| target.as_ref().and_then(|t| find_and_lock_live_pid(&session_dir, &t.path)));
+    let status_line = if progress.session_done {
+        "<span class=\"badge b-done\">session done</span>".to_string()
+    } else if let Some(pid) = live_pid {
+        format!("<span class=\"badge b-run\">running (PID {pid}) — page refreshes every 5s</span>")
+    } else {
+        format!(
+            "<span class=\"badge b-refuted\">not running — no live process for this session</span> \
+             <form method=post action=\"/session/{id}/resume\" style=\"display:inline\">\
+             <button type=submit class=btn style=\"border:0;cursor:pointer;margin-left:.5rem\">Resume analysis</button>\
+             </form>"
+        )
+    };
+
+    let downloads: String = [
+        ("findings.json", "Findings JSON"),
+        ("summary.md", "Summary"),
+        ("attack-graph.md", "Capability graph"),
+        ("attack-graph.json", "Capability graph JSON"),
+        ("target.json", "Target metadata"),
+        ("session.log", "Raw session log"),
+        ("analysis-report.md", "Analysis Markdown"),
+        ("analysis-report.html", "Analysis HTML"),
+    ]
+    .iter()
+    .filter(|(fname, _)| session_dir.join(fname).is_file())
+    .map(|(fname, label)| {
+        let edit = if EDITABLE_FILES.contains(fname) {
+            format!(" <a class=\"btn ghost\" href=\"/session/{id}/edit/{fname}\">Edit</a>")
+        } else { String::new() };
+        format!("<a class=\"btn ghost\" download href=\"/session/{id}/file/{fname}\">{label}</a>{edit}")
+    })
+    .collect();
+    let downloads = if downloads.is_empty() {
+        "<p class=dim>no artifacts yet</p>".to_string()
+    } else {
+        downloads
+    };
+
+    // IOC summary panel — extract from all findings' evidence text
+    let all_evidence_text: String = findings.iter()
+        .flat_map(|f| f.evidence.iter())
+        .map(|e| format!("{} {}", e.detail, e.locus.as_deref().unwrap_or("")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let iocs = extract_iocs(&all_evidence_text);
+    let ioc_panel = if iocs.is_empty() {
+        String::new()
+    } else {
+        let ioc_rows: String = iocs.iter().map(|(kind, value)| {
+            format!("<tr><td>{}</td><td class=wrap-cell><code>{}</code></td></tr>",
+                html_escape(kind), html_escape(value))
+        }).collect();
+        format!(
+            "<div class=card><h3>IOC Summary ({n})</h3><div class=scroll><table>\
+             <tr><th>type</th><th>value</th></tr>{ioc_rows}</table></div></div>",
+            n = iocs.len()
+        )
+    };
+
+    let findings_rows: String = if findings.is_empty() {
+        "<tr><td colspan=6 class=dim>no findings parsed yet</td></tr>".into()
+    } else {
+        findings
+            .iter()
+            .map(|f| {
+                format!(
+                    "<tr><td class=wrap-cell>{title}</td><td>{vc} {mitre}</td>\
+                     <td><span class=\"badge {sb}\">{sev:?}</span></td>\
+                     <td><span class=\"badge {vb}\">{verdict:?}</span></td><td>{evidence}</td></tr>",
+                    title = html_escape(&f.title),
+                    vc = html_escape(&f.vuln_class),
+                    mitre = extract_mitre_techniques(&f.vuln_class).iter()
+                        .map(|t| format!("<span class=\"badge b-info\">{}</span>", html_escape(t)))
+                        .collect::<String>(),
+                    sb = severity_badge(f.severity),
+                    sev = f.severity,
+                    vb = verdict_badge(f.verdict),
+                    verdict = f.verdict,
+                    evidence = f.evidence.len(),
+                )
+            })
+            .collect()
+    };
+
+    let log_tail = html_escape(&progress.tail.join("\n"));
+
+    let refresh = if progress.session_done {
+        String::new()
+    } else {
+        "<meta http-equiv=refresh content=5>".to_string()
+    };
+
+    let body = format!(
+        "{refresh}\
+         <h1>Session {id}</h1>\
+         <div class=card>{target_block}{status_line}{progress_block}\
+         <div class=stagebar>{stage_bar}</div></div>\
+         <div class=card><h3>Downloads</h3>{downloads}</div>\
+         {ioc_panel}\
+         <div class=card><h3>Findings ({n})</h3><div class=scroll><table>\
+         <tr><th>title</th><th>domain</th><th>severity</th><th>verdict</th><th>evidence</th></tr>\
+         {findings_rows}</table></div></div>\
+         <div class=card><h3>Log tail</h3><pre class=log>{log_tail}</pre></div>",
+        n = findings.len(),
+    );
+    layout(&format!("session {id}"), "/sessions", &body).into_response()
+}
+
+// ── Threat Intel (aggregated from sessions) ─────────────────────────────────
+
+async fn threatintel_page(State(st): State<Arc<AppState>>) -> Html<String> {
+    let sessions_dir = st.root.join("sessions");
+    let mut technique_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut family_hypotheses: Vec<String> = Vec::new();
+    let mut all_iocs: Vec<(String, String)> = Vec::new();
+    let mut session_count = 0usize;
+
+    if let Ok(rd) = std::fs::read_dir(&sessions_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_dir() { continue; }
+            let findings: Vec<Finding> = std::fs::read_to_string(p.join("findings.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            if findings.is_empty() { continue; }
+            session_count += 1;
+
+            for f in &findings {
+                for tech in extract_mitre_techniques(&f.vuln_class) {
+                    *technique_counts.entry(tech).or_insert(0) += 1;
+                }
+                let vc_lower = f.vuln_class.to_lowercase();
+                for keyword in ["trojan", "ransomware", "backdoor", "rootkit", "worm", "spyware",
+                                "adware", "dropper", "loader", "stealer", "rat", "botnet", "miner",
+                                "keylogger", "infostealer", "banker"] {
+                    if vc_lower.contains(keyword) && !family_hypotheses.contains(&keyword.to_string()) {
+                        family_hypotheses.push(keyword.to_string());
+                    }
+                }
+                let evidence_text: String = f.evidence.iter()
+                    .map(|e| format!("{} {}", e.detail, e.locus.as_deref().unwrap_or("")))
+                    .collect::<Vec<_>>().join("\n");
+                all_iocs.extend(extract_iocs(&evidence_text));
+            }
+        }
+    }
+    all_iocs.sort();
+    all_iocs.dedup();
+
+    let mut sorted_techniques: Vec<_> = technique_counts.into_iter().collect();
+    sorted_techniques.sort_by(|a, b| b.1.cmp(&a.1));
+    let technique_rows: String = if sorted_techniques.is_empty() {
+        "<tr><td colspan=2 class=dim>no ATT&amp;CK techniques found yet</td></tr>".into()
+    } else {
+        sorted_techniques.iter().map(|(tech, count)| {
+            format!("<tr><td><a href=\"https://attack.mitre.org/techniques/{t}/\" target=_blank>{t}</a></td><td>{c}</td></tr>",
+                t = html_escape(tech), c = count)
+        }).collect()
+    };
+
+    let family_block = if family_hypotheses.is_empty() {
+        "<p class=dim>No malware family hypotheses extracted yet.</p>".to_string()
+    } else {
+        family_hypotheses.iter()
+            .map(|f| format!("<span class=\"badge b-high\">{}</span> ", html_escape(f)))
+            .collect()
+    };
+
+    let ioc_rows: String = if all_iocs.is_empty() {
+        "<tr><td colspan=2 class=dim>no IOCs extracted yet</td></tr>".into()
+    } else {
+        all_iocs.iter().take(200).map(|(kind, value)| {
+            format!("<tr><td>{}</td><td class=wrap-cell><code>{}</code></td></tr>",
+                html_escape(kind), html_escape(value))
+        }).collect()
+    };
+
+    let body = format!(
+        "<h1>Threat Intel</h1>\
+         <p class=dim>Aggregated threat intelligence from {session_count} session(s).</p>\
+         <div class=card><h3>Malware Family Hypotheses</h3>{family_block}</div>\
+         <div class=card><h3>MITRE ATT&amp;CK Techniques</h3><div class=scroll><table>\
+         <tr><th>technique</th><th>count</th></tr>{technique_rows}</table></div></div>\
+         <div class=card><h3>IOC Summary ({ioc_count})</h3><div class=scroll><table>\
+         <tr><th>type</th><th>value</th></tr>{ioc_rows}</table></div></div>",
+        ioc_count = all_iocs.len(),
+    );
+    layout("threat intel", "/threatintel", &body)
+}
+
+// ── Event Scan (YARA/IOC scanning) ──────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct EventScanRequest { file_path: String }
+
+async fn eventscan_page() -> Html<String> {
+    let yara_available = std::process::Command::new("yara")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let yara_status = if yara_available {
+        "<span class=\"badge b-confirmed\">YARA available</span>"
+    } else {
+        "<span class=\"badge b-refuted\">YARA not found</span> <span class=dim>install YARA to enable rule scanning</span>"
+    };
+    let body = format!(
+        "<h1>Event Scan</h1>\
+         <div class=card><p>Scan a file against YARA rules. Provide a file path on the server \
+         filesystem and optionally a directory of YARA rules.</p>\
+         <p>{yara_status}</p>\
+         <form method=post action=\"/eventscan\">\
+         <p><input name=file_path placeholder=\"/path/to/sample.exe\" required \
+         style=\"width:100%;max-width:500px;padding:.55rem .9rem;border-radius:8px;border:1px solid var(--border);\
+         background:var(--card);color:var(--text);font:inherit\"></p>\
+         <button class=btn type=submit>Scan</button></form></div>\
+         <div id=results></div>"
+    );
+    layout("event scan", "/eventscan", &body)
+}
+
+async fn eventscan_run(State(st): State<Arc<AppState>>, Form(req): Form<EventScanRequest>) -> Html<String> {
+    let file_path = req.file_path.trim().to_string();
+    if file_path.is_empty() || !FsPath::new(&file_path).exists() {
+        let body = "<div class=card><p>File not found at the specified path.</p></div>\
+                    <a class=btn href=\"/eventscan\">back</a>";
+        return layout("event scan", "/eventscan", body);
+    }
+
+    let yara_ok = std::process::Command::new("yara")
+        .arg("--version").output()
+        .map(|o| o.status.success()).unwrap_or(false);
+
+    let mut results = String::new();
+
+    if yara_ok {
+        let rules_dirs = [
+            st.root.join("data/yara"),
+            st.root.join("rules"),
+            st.root.join("yara-rules"),
+        ];
+        let mut rule_files: Vec<PathBuf> = Vec::new();
+        for dir in &rules_dirs {
+            if dir.is_dir() {
+                if let Ok(rd) = std::fs::read_dir(dir) {
+                    for entry in rd.flatten() {
+                        let p = entry.path();
+                        if p.extension().and_then(|e| e.to_str()) == Some("yar")
+                            || p.extension().and_then(|e| e.to_str()) == Some("yara") {
+                            rule_files.push(p);
+                        }
+                    }
+                }
+            }
+        }
+
+        if rule_files.is_empty() {
+            results.push_str("<div class=card><p class=dim>No YARA rule files (.yar/.yara) found in data/yara/, rules/, or yara-rules/.</p></div>");
+        } else {
+            let mut rows = String::new();
+            let mut match_count = 0usize;
+            for rule_file in &rule_files {
+                let output = std::process::Command::new("yara")
+                    .arg(rule_file)
+                    .arg(&file_path)
+                    .output();
+                match output {
+                    Ok(out) if out.status.success() => {
+                        let text = String::from_utf8_lossy(&out.stdout);
+                        for line in text.lines() {
+                            if !line.trim().is_empty() {
+                                match_count += 1;
+                                let parts: Vec<&str> = line.splitn(2, ' ').collect();
+                                let rule_name = parts.first().unwrap_or(&"?");
+                                let matched_file = parts.get(1).unwrap_or(&"");
+                                rows.push_str(&format!(
+                                    "<tr><td>{}</td><td>{}</td><td class=wrap-cell>{}</td></tr>",
+                                    html_escape(rule_name),
+                                    html_escape(&rule_file.display().to_string()),
+                                    html_escape(matched_file),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        if !stderr.trim().is_empty() {
+                            rows.push_str(&format!(
+                                "<tr><td class=dim colspan=3>rule file {} error: {}</td></tr>",
+                                html_escape(&rule_file.display().to_string()),
+                                html_escape(stderr.trim()),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        rows.push_str(&format!(
+                            "<tr><td class=dim colspan=3>failed to run YARA: {}</td></tr>",
+                            html_escape(&e.to_string()),
+                        ));
+                    }
+                }
+            }
+            results.push_str(&format!(
+                "<div class=card><h3>YARA Results ({match_count} match(es) from {n} rule file(s))</h3>\
+                 <div class=scroll><table><tr><th>rule</th><th>rule file</th><th>matched file</th></tr>\
+                 {rows}</table></div></div>",
+                n = rule_files.len(),
+            ));
+        }
+    } else {
+        results.push_str("<div class=card><p><span class=\"badge b-refuted\">YARA not found</span> \
+            — install YARA to enable scanning. On macOS: <code>brew install yara</code>.</p></div>");
+    }
+
+    let body = format!(
+        "<h1>Event Scan Results</h1>\
+         <div class=card><p>Scanned: <code>{}</code></p></div>\
+         {results}\
+         <a class=btn href=\"/eventscan\">back</a>",
+        html_escape(&file_path),
+    );
+    layout("event scan", "/eventscan", &body)
+}
+
+// ── Intel Lookup ────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct LookupRequest { query: String }
+
+async fn lookup_page() -> Html<String> {
+    let body = "<h1>Intel Lookup</h1>\
+         <div class=card><p>Research a hash, IP, domain, MITRE technique ID, or malware family name. \
+         Launches a quick LLM query via the malvex binary for contextual research.</p>\
+         <form method=post action=\"/lookup\">\
+         <p><input name=query placeholder=\"e.g. T1055, 192.168.1.100, Grandoreiro, SHA256...\" required \
+         style=\"width:100%;max-width:500px;padding:.55rem .9rem;border-radius:8px;border:1px solid var(--border);\
+         background:var(--card);color:var(--text);font:inherit\"></p>\
+         <button class=btn type=submit>Research</button></form></div>";
+    layout("intel lookup", "/lookup", body)
+}
+
+async fn lookup_run(State(st): State<Arc<AppState>>, Form(req): Form<LookupRequest>) -> Html<String> {
+    let query = req.query.trim().to_string();
+    if query.is_empty() || query.len() > 500 {
+        let body = "<div class=card><p>Query must be between 1 and 500 characters.</p></div>\
+                    <a class=btn href=\"/lookup\">back</a>";
+        return layout("intel lookup", "/lookup", body);
+    }
+
+    let bin = st.root.join("target/release/malvex");
+    let result = if bin.is_file() {
+        let output = tokio::time::timeout(
+            Duration::from_secs(120),
+            tokio::process::Command::new(&bin)
+                .arg("lookup")
+                .arg(&query)
+                .arg("--root")
+                .arg(&st.root)
+                .output()
+        ).await;
+        match output {
+            Ok(Ok(out)) => {
+                let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+                if !out.stderr.is_empty() {
+                    text.push_str("\n--- stderr ---\n");
+                    text.push_str(&String::from_utf8_lossy(&out.stderr));
+                }
+                if text.trim().is_empty() {
+                    "No output from malvex lookup. The 'lookup' subcommand may not be implemented yet.".to_string()
+                } else {
+                    text
+                }
+            }
+            Ok(Err(e)) => format!("Failed to run malvex lookup: {e}"),
+            Err(_) => "Lookup timed out after 120 seconds.".to_string(),
+        }
+    } else {
+        "malvex binary not found — build it first: cargo build --release -p malvex-cli".to_string()
+    };
+
+    let body = format!(
+        "<h1>Intel Lookup</h1>\
+         <div class=card><h3>Query: {}</h3><pre class=log>{}</pre></div>\
+         <a class=btn href=\"/lookup\">new lookup</a>",
+        html_escape(&query),
+        html_escape(&result),
+    );
+    layout("intel lookup", "/lookup", &body)
+}
+
+// ── Proc DB (malicious process imphash database) ────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct ProcDbEntry {
+    app_name: String,
+    family: String,
+    #[serde(default)]
+    executable_names: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    imphashes: Vec<String>,
+    #[serde(default)]
+    sha256: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProcDbAddRequest {
+    app_name: String,
+    family: String,
+    #[serde(default)]
+    executable_names: String,
+    #[serde(default)]
+    tags: String,
+    #[serde(default)]
+    imphashes: String,
+    #[serde(default)]
+    sha256: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ProcDbSearchRequest {
+    #[serde(default)]
+    q: String,
+}
+
+async fn procdb_page(State(st): State<Arc<AppState>>, axum::extract::Query(search): axum::extract::Query<ProcDbSearchRequest>) -> Html<String> {
+    let db_path = st.root.join("data/procdb.json");
+    let entries: Vec<ProcDbEntry> = std::fs::read_to_string(&db_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let q = search.q.trim().to_lowercase();
+    let filtered: Vec<&ProcDbEntry> = if q.is_empty() {
+        entries.iter().collect()
+    } else {
+        entries.iter().filter(|e| {
+            e.app_name.to_lowercase().contains(&q)
+                || e.family.to_lowercase().contains(&q)
+                || e.executable_names.iter().any(|n| n.to_lowercase().contains(&q))
+                || e.tags.iter().any(|t| t.to_lowercase().contains(&q))
+                || e.imphashes.iter().any(|h| h.to_lowercase().contains(&q))
+        }).collect()
+    };
+
+    let rows: String = if filtered.is_empty() {
+        "<tr><td colspan=6 class=dim>no entries yet — add one below or place data/procdb.json manually</td></tr>".into()
+    } else {
+        filtered.iter().map(|e| format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            html_escape(&e.app_name),
+            html_escape(&e.family),
+            html_escape(&e.executable_names.join(", ")),
+            html_escape(&e.tags.join(", ")),
+            e.imphashes.len(),
+            e.sha256.len(),
+        )).collect()
+    };
+
+    let body = format!(
+        "<h1>Proc DB</h1>\
+         <p class=dim>Malicious process imphash database. {total} entries total.</p>\
+         <div class=card><h3>Search / Filter</h3>\
+         <form method=get action=\"/procdb\">\
+         <input name=q value=\"{q_esc}\" placeholder=\"filter by name, family, tag, hash...\" \
+         style=\"width:100%;max-width:400px;padding:.55rem .9rem;border-radius:8px;border:1px solid var(--border);\
+         background:var(--card);color:var(--text);font:inherit\"> \
+         <button class=btn type=submit>Filter</button>\
+         {clear}</form></div>\
+         <div class=card><div class=scroll><table>\
+         <tr><th>app name</th><th>family</th><th>executables</th><th>tags</th><th>imphashes</th><th>sha256</th></tr>\
+         {rows}</table></div></div>\
+         <div class=card><h3>Add Entry</h3>\
+         <form method=post action=\"/procdb\">\
+         <p><input name=app_name placeholder=\"App name (e.g. Grandoreiro)\" required \
+         style=\"padding:.5rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font:inherit\"> \
+         <input name=family placeholder=\"Family (e.g. Banking Trojan)\" required \
+         style=\"padding:.5rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font:inherit\"></p>\
+         <p><input name=executable_names placeholder=\"Executable names (comma-separated)\" \
+         style=\"width:100%;max-width:500px;padding:.5rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font:inherit\"></p>\
+         <p><input name=tags placeholder=\"Tags (comma-separated)\" \
+         style=\"width:100%;max-width:500px;padding:.5rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font:inherit\"></p>\
+         <p><input name=imphashes placeholder=\"Imphashes (comma-separated)\" \
+         style=\"width:100%;max-width:500px;padding:.5rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font:inherit\"></p>\
+         <p><input name=sha256 placeholder=\"SHA256 hashes (comma-separated)\" \
+         style=\"width:100%;max-width:500px;padding:.5rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font:inherit\"></p>\
+         <button class=btn type=submit>Add entry</button></form></div>",
+        total = entries.len(),
+        q_esc = html_escape(&search.q),
+        clear = if q.is_empty() { String::new() } else { " <a class=\"btn ghost\" href=\"/procdb\">clear</a>".into() },
+    );
+    layout("proc db", "/procdb", &body)
+}
+
+async fn procdb_add(State(st): State<Arc<AppState>>, Form(req): Form<ProcDbAddRequest>) -> Redirect {
+    let db_path = st.root.join("data/procdb.json");
+    let _ = std::fs::create_dir_all(st.root.join("data"));
+    let mut entries: Vec<ProcDbEntry> = std::fs::read_to_string(&db_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let parse_csv = |s: &str| -> Vec<String> {
+        s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+    };
+
+    if let Some(existing) = entries.iter_mut().find(|e| e.app_name.eq_ignore_ascii_case(&req.app_name)) {
+        for name in parse_csv(&req.executable_names) {
+            if !existing.executable_names.contains(&name) { existing.executable_names.push(name); }
+        }
+        for tag in parse_csv(&req.tags) {
+            if !existing.tags.contains(&tag) { existing.tags.push(tag); }
+        }
+        for hash in parse_csv(&req.imphashes) {
+            if !existing.imphashes.contains(&hash) { existing.imphashes.push(hash); }
+        }
+        for hash in parse_csv(&req.sha256) {
+            if !existing.sha256.contains(&hash) { existing.sha256.push(hash); }
+        }
+    } else {
+        entries.push(ProcDbEntry {
+            app_name: req.app_name.trim().to_string(),
+            family: req.family.trim().to_string(),
+            executable_names: parse_csv(&req.executable_names),
+            tags: parse_csv(&req.tags),
+            imphashes: parse_csv(&req.imphashes),
+            sha256: parse_csv(&req.sha256),
+        });
+    }
+
+    let _ = std::fs::write(&db_path, serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".into()));
+    Redirect::to("/procdb")
+}
+
+// ── Remote Box (sandbox connector config) ───────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct RemoteBoxConfig {
+    name: String,
+    url: String,
+    api_key: String,
+    sandbox_type: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RemoteBoxAddRequest {
+    name: String,
+    url: String,
+    api_key: String,
+    sandbox_type: String,
+}
+
+async fn remotebox_page(State(st): State<Arc<AppState>>) -> Html<String> {
+    let config_path = st.root.join("data/remotebox.json");
+    let configs: Vec<RemoteBoxConfig> = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    let rows: String = if configs.is_empty() {
+        "<tr><td colspan=4 class=dim>no sandbox endpoints configured yet</td></tr>".into()
+    } else {
+        configs.iter().map(|c| format!(
+            "<tr><td>{}</td><td><code>{}</code></td><td>{}</td>\
+             <td><code>{}</code></td></tr>",
+            html_escape(&c.name),
+            html_escape(&c.url),
+            html_escape(&c.sandbox_type),
+            if c.api_key.len() > 8 {
+                format!("{}...{}", &c.api_key[..4], &c.api_key[c.api_key.len()-4..])
+            } else {
+                "****".to_string()
+            },
+        )).collect()
+    };
+
+    let body = format!(
+        "<h1>Remote Box</h1>\
+         <p class=dim>Configure remote sandbox endpoints for dynamic analysis.</p>\
+         <div class=card><div class=scroll><table>\
+         <tr><th>name</th><th>url</th><th>type</th><th>api key</th></tr>\
+         {rows}</table></div></div>\
+         <div class=card><h3>Add Sandbox Endpoint</h3>\
+         <form method=post action=\"/remotebox\">\
+         <p><input name=name placeholder=\"Sandbox name\" required \
+         style=\"padding:.5rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font:inherit\"></p>\
+         <p><input name=url placeholder=\"https://sandbox.example.com/api/v1\" required \
+         style=\"width:100%;max-width:500px;padding:.5rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font:inherit\"></p>\
+         <p><input name=api_key placeholder=\"API key\" type=password \
+         style=\"width:100%;max-width:500px;padding:.5rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font:inherit\"></p>\
+         <p><select name=sandbox_type \
+         style=\"padding:.5rem .7rem;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font:inherit\">\
+         <option value=\"cuckoo\">Cuckoo Sandbox</option>\
+         <option value=\"cape\">CAPE Sandbox</option>\
+         <option value=\"any-run\">ANY.RUN</option>\
+         <option value=\"joe-sandbox\">Joe Sandbox</option>\
+         <option value=\"hybrid-analysis\">Hybrid Analysis</option>\
+         <option value=\"vmray\">VMRay</option>\
+         <option value=\"custom\">Custom API</option>\
+         </select></p>\
+         <button class=btn type=submit>Add endpoint</button></form></div>"
+    );
+    layout("remote box", "/remotebox", &body)
+}
+
+async fn remotebox_add(State(st): State<Arc<AppState>>, Form(req): Form<RemoteBoxAddRequest>) -> Redirect {
+    let config_path = st.root.join("data/remotebox.json");
+    let _ = std::fs::create_dir_all(st.root.join("data"));
+    let mut configs: Vec<RemoteBoxConfig> = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    configs.push(RemoteBoxConfig {
+        name: req.name.trim().chars().take(120).collect(),
+        url: req.url.trim().chars().take(500).collect(),
+        api_key: req.api_key.trim().to_string(),
+        sandbox_type: req.sandbox_type.trim().to_string(),
+    });
+
+    let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&configs).unwrap_or_else(|_| "[]".into()));
+    Redirect::to("/remotebox")
+}
+
+// ── Artifact download ────────────────────────────────────────────────────────
+
+const ALLOWED_FILES: &[&str] = &[
+    "findings.json",
+    "attack-graph.md",
+    "attack-graph.json",
+    "session.log",
+    "summary.md",
+    "target.json",
+    "analysis-report.md",
+    "analysis-report.html",
+];
+
+fn content_type_for(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("") {
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "html" => "text/html; charset=utf-8",
+        "md" => "text/markdown; charset=utf-8",
+        "log" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn session_file(State(st): State<Arc<AppState>>, Path((id, name)): Path<(String, String)>) -> Response {
+    if !safe_component(&id) || !ALLOWED_FILES.contains(&name.as_str()) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let path = st.root.join("sessions").join(&id).join(&name);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let ct = content_type_for(&name);
+            ([(header::CONTENT_TYPE, ct)], bytes).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "file not found").into_response(),
+    }
+}
+
+const EDITABLE_FILES: &[&str] = &["analysis-report.md", "summary.md", "attack-graph.md"];
+
+async fn edit_file(State(st): State<Arc<AppState>>, Path((id, name)): Path<(String, String)>) -> Response {
+    if !safe_component(&id) || !EDITABLE_FILES.contains(&name.as_str()) { return (StatusCode::NOT_FOUND, "not editable").into_response(); }
+    let path = st.root.join("sessions").join(&id).join(&name);
+    let text = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+    let body = format!("<style>body{{background:#0b0d12;color:#e7ebf3;font:14px system-ui;margin:0}}.ide{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;height:calc(100vh - 120px)}}textarea,.preview{{width:100%;height:100%;box-sizing:border-box;background:#111824;color:#e7ebf3;border:1px solid #33435e;border-radius:8px;padding:16px;font:14px/1.6 ui-monospace,SFMono-Regular,monospace;white-space:pre-wrap;overflow:auto}}.bar{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}}button,a{{background:#82a9ff;color:#07101f;border:0;border-radius:6px;padding:9px 14px;font-weight:700;text-decoration:none}}a{{background:#202b3b;color:#e7ebf3}}@media(max-width:800px){{.ide{{grid-template-columns:1fr;height:auto}}.preview{{min-height:360px}}}}</style><div class=bar><a href='/session/{id}'>← Session</a><b>Mini IDE · {name}</b><button form=editor>Save changes</button><a href='/session/{id}/file/{name}' download>Download</a></div><div class=ide><form id=editor method=post><textarea name=content>{}</textarea></form><pre class=preview>{}</pre></div>", html_escape(&text), html_escape(&text));
+    layout(&format!("edit {name}"), "/sessions", &body).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct FileEdit { content: String }
+
+async fn save_file(State(st): State<Arc<AppState>>, Path((id, name)): Path<(String, String)>, Form(edit): Form<FileEdit>) -> Response {
+    if !safe_component(&id) || !EDITABLE_FILES.contains(&name.as_str()) { return (StatusCode::NOT_FOUND, "not editable").into_response(); }
+    let path = st.root.join("sessions").join(&id).join(&name);
+    if !path.is_file() { return (StatusCode::NOT_FOUND, "file not found").into_response(); }
+    let backup = path.with_extension(format!("{}.bak", path.extension().and_then(|x| x.to_str()).unwrap_or("txt")));
+    let _ = tokio::fs::copy(&path, &backup).await;
+    if let Err(e) = tokio::fs::write(&path, edit.content.chars().take(2_000_000).collect::<String>()).await { return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(); }
+    Redirect::to(&format!("/session/{id}/edit/{name}")).into_response()
+}

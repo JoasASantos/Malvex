@@ -1,0 +1,208 @@
+version: 2
+vectors:
+  - id: triage-initial
+    title: Initial malware triage and dossier
+    sev: info
+    platforms: [windows, linux, macos]
+    agent: triage
+    tools: [file, die, lief, yara, strings]
+    prior_ref: null
+    detect: "hashes, real type, architecture, signing, timestamp, entropy, sections, imports, strings, initial IOCs"
+
+  - id: static-analysis
+    title: Static format-aware analysis
+    sev: info
+    platforms: [windows, linux, macos]
+    agent: static-core
+    tools: [lief, ghidra, radare2, otool, readelf]
+    prior_ref: null
+    detect: "headers, resources, manifests, TLS, relocations, runtime/framework fingerprints, sensitive APIs"
+
+  - id: disassembly-decompilation
+    title: Deep disassembly, decompilation, and function renaming
+    sev: info
+    platforms: [windows, linux, macos]
+    agent: decompilation
+    tools: [ida-pro, ghidra, radare2, binaryninja]
+    prior_ref: null
+    detect: "main flow, call graph, CFG, xrefs, function roles, structures, indirect calls, syscalls"
+
+  - id: packing-obfuscation
+    title: Packing and obfuscation recovery
+    sev: medium
+    platforms: [windows, linux, macos]
+    agent: deobfuscation
+    tools: [upx, die, yara, x64dbg, lldb, unicorn]
+    prior_ref: null
+    detect: "packer/protector, OEP, runtime unpacking, string/API decryption, CFF, staged payloads"
+
+  - id: debugging
+    title: Debugging strategy and runtime breakpointing
+    sev: info
+    platforms: [windows, linux, macos]
+    agent: dynamic-analysis
+    tools: [x64dbg, windbg, lldb, gdb, frida]
+    prior_ref: null
+    detect: "entrypoint and key breakpoints, args, registers, stack, threads, exceptions, resolved APIs"
+
+  - id: dynamic-analysis
+    title: Runtime behavior observation
+    sev: medium
+    platforms: [windows, linux, macos]
+    agent: dynamic-analysis
+    tools: [frida, procmon, strace, ltrace, fsmon]
+    prior_ref: null
+    detect: "process, file, registry/service/task, IPC, environment, host, user, and network activity"
+
+  - id: process-memory-analysis
+    title: Process and memory investigation
+    sev: high
+    platforms: [windows, linux, macos]
+    agent: memory-analysis
+    tools: [frida, windbg, lldb, gdb, volatility]
+    prior_ref: null
+    detect: "RWX/private executable memory, hollowing, reflective loading, manual mapping, decrypted strings/config"
+
+  - id: network-analysis
+    title: C2 and network behavior extraction
+    sev: high
+    platforms: [windows, linux, macos]
+    agent: memory-analysis
+    tools: [tcpdump, tshark, mitmproxy, ja4, yara]
+    prior_ref: null
+    detect: "DNS, HTTP, HTTPS, TLS, beaconing, protocol, DGA, exfil paths, hardcoded infra"
+
+  - id: persistence-analysis
+    title: Persistence mechanism mapping
+    sev: high
+    platforms: [windows, linux, macos]
+    agent: dynamic-analysis
+    tools: [autoruns, reg, launchctl, systemctl, crontab]
+    prior_ref: null
+    detect: "run keys, startup, tasks, services, WMI, systemd, cron, launch agents, login scripts"
+
+  - id: discovery-analysis
+    title: Host and user discovery behavior
+    sev: medium
+    platforms: [windows, linux, macos]
+    agent: dynamic-analysis
+    tools: [frida, strace, procmon, ltrace]
+    prior_ref: null
+    detect: "OS, username, hostname, privileges, software, security products, processes, drives, locale, VM checks"
+
+  - id: credential-data-access
+    title: Credential and data targeting
+    sev: high
+    platforms: [windows, linux, macos]
+    agent: decompilation
+    tools: [ida-pro, ghidra, sqlite, strings]
+    prior_ref: null
+    detect: "browser stores, cookies, wallets, SSH, cloud/dev credentials, env vars, clipboard, screenshot, keylogging"
+
+  - id: privilege-escalation
+    title: Privilege escalation behavior
+    sev: high
+    platforms: [windows, linux, macos]
+    agent: dynamic-analysis
+    tools: [frida, windbg, lldb, gdb]
+    prior_ref: null
+    detect: "token abuse, UAC, driver use, impersonation, exploit helpers, elevated child processes"
+
+  - id: defense-evasion
+    title: Defense evasion behavior
+    sev: high
+    platforms: [windows, linux, macos]
+    agent: deobfuscation
+    tools: [ghidra, ida-pro, yara, frida]
+    prior_ref: null
+    detect: "sandbox, VM, timing, security-product checks, LOTL, cleanup, self-delete, masquerade, signed-binary abuse"
+
+  - id: command-and-control
+    title: Command-and-control logic
+    sev: high
+    platforms: [windows, linux, macos]
+    agent: dynamic-analysis
+    tools: [frida, tshark, mitmproxy]
+    prior_ref: null
+    detect: "C2 config, auth, encryption, tasking, fallback infra, proxy, Tor, dead-drop, cloud abuse"
+
+  - id: exfiltration-analysis
+    title: Data exfiltration logic
+    sev: high
+    platforms: [windows, linux, macos]
+    agent: dynamic-analysis
+    tools: [frida, tshark, mitmproxy]
+    prior_ref: null
+    detect: "staging, compression, encryption, chunking, POST/API/custom exfil, destination, cleanup"
+
+  - id: anti-analysis
+    title: Anti-analysis checks and blockers
+    sev: medium
+    platforms: [windows, linux, macos]
+    agent: deobfuscation
+    tools: [ida-pro, ghidra, frida, x64dbg, lldb]
+    prior_ref: null
+    detect: "debugger, PEB, timing, hardware, VM, sandbox, exception, self-modifying, control-flow checks"
+
+  - id: malware-configuration
+    title: Embedded malware configuration recovery
+    sev: medium
+    platforms: [windows, linux, macos]
+    agent: static-core
+    tools: [strings, lief, ghidra]
+    prior_ref: null
+    detect: "campaign IDs, bot IDs, keys, C2, flags, mutexes, public keys, beacon config"
+
+  - id: capability-mapping
+    title: Capability and ATT&CK mapping
+    sev: info
+    platforms: [windows, linux, macos]
+    agent: decompilation
+    tools: [ida-pro, ghidra]
+    prior_ref: null
+    detect: "execution, persistence, discovery, credential access, collection, defense evasion, C2, exfiltration, impact"
+
+  - id: ioc-extraction
+    title: IOC extraction and normalization
+    sev: info
+    platforms: [windows, linux, macos]
+    agent: triage
+    tools: [strings, yara, tshark]
+    prior_ref: null
+    detect: "hashes, infra, filenames, paths, registry, mutexes, services, tasks, certificates, user-agents, pipes"
+
+  - id: detection-engineering
+    title: Detection rule generation
+    sev: info
+    platforms: [windows, linux, macos]
+    agent: detection-engineering
+    tools: [yara, sigma, mitre-attack]
+    prior_ref: null
+    detect: "YARA, Sigma, EDR logic, network and memory indicators, behavioral sequences"
+
+  - id: threat-intelligence
+    title: Threat intelligence enrichment
+    sev: info
+    platforms: [windows, linux, macos]
+    agent: threat-intel
+    tools: [yara, strings, graph]
+    prior_ref: null
+    detect: "family, overlap, variant, code reuse, infra overlap, config overlap, compilation and TTP similarities"
+
+  - id: malware-lineage
+    title: Malware lineage and variant clustering
+    sev: info
+    platforms: [windows, linux, macos]
+    agent: threat-intel
+    tools: [graph, embeddings, cfg]
+    prior_ref: null
+    detect: "function, CFG, call graph, code, protocol, config, and behavioral similarity"
+
+  - id: ai-assisted-re
+    title: AI-assisted reverse engineering workflow
+    sev: info
+    platforms: [windows, linux, macos]
+    agent: decompilation
+    tools: [llm, ida-pro, ghidra, frida]
+    prior_ref: null
+    detect: "classification, renaming, explanation, algorithm recognition, IOC context, ATT&CK mapping, variant comparison"

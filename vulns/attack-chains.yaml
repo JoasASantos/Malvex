@@ -1,0 +1,37 @@
+version: 1
+chains:
+  - id: loader-to-stealer
+    platform: windows
+    composite_cvss: 9.1
+    steps:
+      - packing-obfuscation
+      - disassembly-decompilation
+      - credential-data-access
+      - exfiltration-analysis
+
+  - id: cross-platform-rat
+    platform: macos
+    composite_cvss: 8.8
+    steps:
+      - dynamic-analysis
+      - persistence-analysis
+      - command-and-control
+      - discovery-analysis
+
+  - id: linux-credential-harvest
+    platform: linux
+    composite_cvss: 8.4
+    steps:
+      - discovery-analysis
+      - credential-data-access
+      - command-and-control
+      - exfiltration-analysis
+
+  - id: anti-analysis-loader
+    platform: windows
+    composite_cvss: 8.0
+    steps:
+      - anti-analysis
+      - defense-evasion
+      - packing-obfuscation
+      - process-memory-analysis

@@ -1,0 +1,99 @@
+# Malvex — Provider Configuration Reference
+#
+# Malvex supports 5 runtime backends. The provider is replaceable; the session
+# model and evidence model are not. Switch with --runtime <name> or
+# MALVEX_RUNTIME=<name>.
+
+providers:
+  claude:
+    description: "Claude Code CLI — default, full feature set"
+    command: "claude -p <prompt> --model <model> --fallback-model <fallbacks> --dangerously-skip-permissions --append-system-prompt-file agents/<role>.md --add-dir <root> --output-format json"
+    env:
+      IS_SANDBOX: "1"
+    features:
+      - MCP server integration (IDA, Ghidra, radare2, Frida, YARA)
+      - Agent-scoped system prompts via --append-system-prompt-file
+      - Fallback model chain
+      - Structured JSON output
+      - Directory-scoped context via --add-dir
+    notes: >
+      Authenticate once interactively with `claude` before using. Supports
+      subscription and API key auth. MCP tools registered via `claude mcp add`
+      are automatically available to agents.
+
+  codex:
+    description: "Codex CLI — ephemeral, non-interactive execution"
+    command: "codex exec --skip-git-repo-check --ephemeral <merged-prompt>"
+    env:
+      MALVEX_MODEL_HINT: "model hint for codex"
+      MALVEX_FALLBACK_HINTS: "comma-separated fallbacks"
+    features:
+      - Ephemeral execution (no session state)
+      - Git repo check bypass for analysis-only workflows
+    notes: >
+      Agent system prompt is merged into the main prompt. Does not support
+      MCP server integration directly. Set MALVEX_MODEL_HINT for model
+      selection.
+
+  hermes:
+    description: "Hermes engine — deepseek/qwen/kimi/glm/grok via hermes"
+    command: "hermes run --prompt <prompt> --provider <provider> --model <model>"
+    env:
+      MALVEX_HERMES_PROVIDER: "provider name (e.g. opencode-go, openrouter)"
+      MALVEX_HERMES_MODEL: "model name (e.g. deepseek-v4-pro, qwen3.8-max, kimi-k3, glm-5.3)"
+    features:
+      - Multiple LLM provider backends
+      - Rate-limit-aware failover
+      - Chinese LLM support (deepseek, qwen, kimi, glm)
+      - Alternative to Claude when quota exhausted
+    notes: >
+      Install hermes: https://github.com/nichochar/hermes. Configure
+      provider/model via env vars or --hermes-provider/--hermes-model flags.
+      Find valid provider/model names with `hermes model`.
+
+  ollama:
+    description: "Ollama — local LLM, offline, air-gapped labs"
+    command: "echo <prompt> | ollama run <model>"
+    env:
+      MALVEX_OLLAMA_MODEL: "local model name (e.g. llama3.3, codestral, qwen2.5-coder)"
+    features:
+      - Fully offline execution
+      - Air-gapped lab compatible
+      - No API keys or accounts needed
+      - Self-hosted models
+    notes: >
+      Install ollama: https://ollama.com. Pull a model first: `ollama pull
+      llama3.3`. Quality depends heavily on model size — 70B+ recommended
+      for malware analysis. Smaller models may produce low-quality findings.
+      No MCP integration.
+
+  custom:
+    description: "Custom wrapper — any provider via MALVEX_CUSTOM_CMD"
+    command: "eval $MALVEX_CUSTOM_CMD"
+    env:
+      MALVEX_CUSTOM_CMD: "shell command to execute (required)"
+      MALVEX_PROMPT: "full prompt including agent system prompt"
+      MALVEX_MODEL: "requested model name"
+      MALVEX_FALLBACKS: "comma-separated fallback model names"
+      MALVEX_AGENT: "agent role name (triage, static-core, etc.)"
+      MALVEX_ROOT: "repo root path"
+    features:
+      - Any LLM provider (OpenRouter, Together, Groq, local gateway)
+      - Custom routing and load balancing
+      - Enterprise API gateways
+      - Bring your own wrapper script
+    notes: >
+      Write a wrapper script that reads MALVEX_PROMPT and outputs findings
+      JSON to stdout. Example:
+        export MALVEX_CUSTOM_CMD="./my-openrouter-wrapper.sh"
+        malvex run sample.exe --runtime custom
+
+# Environment variable summary:
+#
+# MALVEX_RUNTIME          Default runtime backend (claude|codex|custom|hermes|ollama)
+# MALVEX_APPROVAL_MODE    Default approval policy (auto|confirm-risky|human)
+# MALVEX_CUSTOM_CMD       Command for the custom runtime
+# MALVEX_MODEL_HINT       Model hint for Codex
+# MALVEX_HERMES_PROVIDER  Hermes provider name
+# MALVEX_HERMES_MODEL     Hermes model name
+# MALVEX_OLLAMA_MODEL     Ollama model name

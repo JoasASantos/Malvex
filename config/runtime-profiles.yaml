@@ -1,0 +1,24 @@
+version: 1
+profiles:
+  - id: claude
+    description: Uses Claude Code CLI as the agent runtime.
+    notes:
+      - Malvex assumes headless-first execution and uses GUI tooling only as a fallback.
+      - Uses the active CLI login session.
+      - Supports MCP-heavy local reverse-engineering workflows well.
+
+  - id: codex
+    description: Uses Codex CLI non-interactively.
+    notes:
+      - Malvex assumes headless-first execution and uses GUI tooling only as a fallback.
+      - Intended for ChatGPT-plan-backed or API-backed Codex workflows.
+      - The current integration uses `codex exec --skip-git-repo-check --ephemeral`.
+      - Model selection can be handled by the user's Codex configuration; Malvex passes `MALVEX_MODEL_HINT` as metadata.
+
+  - id: custom
+    description: Executes a user-provided wrapper command.
+    notes:
+      - Malvex assumes headless-first execution and uses GUI tooling only as a fallback.
+      - Set `MALVEX_CUSTOM_CMD` in the environment.
+      - Malvex exposes `MALVEX_PROMPT`, `MALVEX_MODEL`, `MALVEX_FALLBACKS`, `MALVEX_AGENT`, and `MALVEX_ROOT`.
+      - Use this path for OpenAI-compatible gateways, OpenRouter, internal brokers, or any custom provider router.

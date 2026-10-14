@@ -1,0 +1,80 @@
+version: 1
+mode: headless-first
+
+principles:
+  - Prefer non-GUI tooling for agentic workflows, CI, remote sandboxes, and batch triage.
+  - Use GUI tools only when an analyst needs visual inspection, manual annotation, or interactive debugging.
+  - Headless evidence still needs file offsets, RVAs/VAs, strings, xrefs, graph context, and runtime artifacts.
+
+profiles:
+  cross-platform:
+    triage:
+      - file
+      - exiftool
+      - strings
+      - floss
+      - capa
+      - binwalk
+      - yara
+    static:
+      - lief
+      - readelf
+      - objdump
+      - nm
+    detection:
+      - yara
+      - sigma
+      - ssdeep
+      - hashdeep
+
+  windows:
+    disassembly:
+      - idat
+      - re-mcp-ida
+      - ghidra analyzeHeadless
+      - radare2
+      - rizin
+    dynamic:
+      - frida
+      - x64dbg bridge
+      - tshark
+
+  linux:
+    disassembly:
+      - ghidra analyzeHeadless
+      - radare2
+      - rizin
+      - re-mcp-ghidra
+    dynamic:
+      - gdb
+      - strace
+      - ltrace
+      - frida
+      - tcpdump
+
+  macos:
+    disassembly:
+      - idat
+      - re-mcp-ida
+      - otool
+      - radare2
+      - rizin
+    dynamic:
+      - lldb
+      - frida
+      - mitmproxy
+      - tcpdump
+
+delivery:
+  required_artifacts:
+    - findings.json
+    - summary.md
+    - attack-graph.md
+    - attack-graph.json
+    - session.log
+  optional_artifacts:
+    - iocs.json
+    - detections/yara
+    - detections/sigma
+    - memory
+    - pcap
