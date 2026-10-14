@@ -219,7 +219,7 @@ fn layout(title: &str, active: &str, body: &str) -> Html<String> {
         "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>{title} — Malvex</title><style>{STYLE}</style>\
          <body><div class=wrap>\
-         <nav><a class=brand href=\"/\">Malvex<span class=dot></span></a><a href=\"/\">Investigator</a><a href=\"/sessions\">Sessions</a><a href=\"/threatintel\">Threat Intel</a><a href=\"/eventscan\">Event Scan</a><a href=\"/lookup\">Intel Lookup</a><a href=\"/procdb\">Proc DB</a><a href=\"/remotebox\">Remote Box</a><a href=\"/store\">Store</a><a href=\"/schedule\">Schedules</a><a href=\"/settings\">Settings</a></nav>\
+         <nav><a class=brand href=\"/\">Malvex<span class=dot></span></a><a href=\"/\">Investigator</a><a href=\"/sessions\">Sessions</a><a href=\"/threatintel\">IOC Feed</a><a href=\"/eventscan\">YARA Scan</a><a href=\"/lookup\">Intel Lookup</a><a href=\"/procdb\">Sample DB</a><a href=\"/remotebox\">Sandbox</a><a href=\"/store\">Store</a><a href=\"/schedule\">Schedules</a><a href=\"/settings\">Settings</a></nav>\
          {body}\
          </div></body>",
     ))
@@ -1798,8 +1798,8 @@ async fn threatintel_page(State(st): State<Arc<AppState>>) -> Html<String> {
     };
 
     let body = format!(
-        "<h1>Threat Intel</h1>\
-         <p class=dim>Aggregated threat intelligence from {session_count} session(s).</p>\
+        "<h1>IOC Feed</h1>\
+         <p class=dim>Aggregated indicators of compromise from {session_count} session(s).</p>\
          <div class=card><h3>Malware Family Hypotheses</h3>{family_block}</div>\
          <div class=card><h3>MITRE ATT&amp;CK Techniques</h3><div class=scroll><table>\
          <tr><th>technique</th><th>count</th></tr>{technique_rows}</table></div></div>\
@@ -1807,7 +1807,7 @@ async fn threatintel_page(State(st): State<Arc<AppState>>) -> Html<String> {
          <tr><th>type</th><th>value</th></tr>{ioc_rows}</table></div></div>",
         ioc_count = all_iocs.len(),
     );
-    layout("threat intel", "/threatintel", &body)
+    layout("ioc feed", "/threatintel", &body)
 }
 
 // ── Event Scan (YARA/IOC scanning) ──────────────────────────────────────────
@@ -1827,9 +1827,9 @@ async fn eventscan_page() -> Html<String> {
         "<span class=\"badge b-refuted\">YARA not found</span> <span class=dim>install YARA to enable rule scanning</span>"
     };
     let body = format!(
-        "<h1>Event Scan</h1>\
+        "<h1>YARA Scan</h1>\
          <div class=card><p>Scan a file against YARA rules. Provide a file path on the server \
-         filesystem and optionally a directory of YARA rules.</p>\
+         filesystem.</p>\
          <p>{yara_status}</p>\
          <form method=post action=\"/eventscan\">\
          <p><input name=file_path placeholder=\"/path/to/sample.exe\" required \
@@ -1838,7 +1838,7 @@ async fn eventscan_page() -> Html<String> {
          <button class=btn type=submit>Scan</button></form></div>\
          <div id=results></div>"
     );
-    layout("event scan", "/eventscan", &body)
+    layout("yara scan", "/eventscan", &body)
 }
 
 async fn eventscan_run(State(st): State<Arc<AppState>>, Form(req): Form<EventScanRequest>) -> Html<String> {
@@ -1846,7 +1846,7 @@ async fn eventscan_run(State(st): State<Arc<AppState>>, Form(req): Form<EventSca
     if file_path.is_empty() || !FsPath::new(&file_path).exists() {
         let body = "<div class=card><p>File not found at the specified path.</p></div>\
                     <a class=btn href=\"/eventscan\">back</a>";
-        return layout("event scan", "/eventscan", body);
+        return layout("yara scan", "/eventscan", body);
     }
 
     let yara_ok = std::process::Command::new("yara")
@@ -1941,7 +1941,7 @@ async fn eventscan_run(State(st): State<Arc<AppState>>, Form(req): Form<EventSca
          <a class=btn href=\"/eventscan\">back</a>",
         html_escape(&file_path),
     );
-    layout("event scan", "/eventscan", &body)
+    layout("yara scan", "/eventscan", &body)
 }
 
 // ── Intel Lookup ────────────────────────────────────────────────────────────
@@ -2081,7 +2081,7 @@ async fn procdb_page(State(st): State<Arc<AppState>>, axum::extract::Query(searc
     };
 
     let body = format!(
-        "<h1>Proc DB</h1>\
+        "<h1>Sample DB</h1>\
          <p class=dim>Malicious process imphash database. {total} entries total.</p>\
          <div class=card><h3>Search / Filter</h3>\
          <form method=get action=\"/procdb\">\
@@ -2112,7 +2112,7 @@ async fn procdb_page(State(st): State<Arc<AppState>>, axum::extract::Query(searc
         q_esc = html_escape(&search.q),
         clear = if q.is_empty() { String::new() } else { " <a class=\"btn ghost\" href=\"/procdb\">clear</a>".into() },
     );
-    layout("proc db", "/procdb", &body)
+    layout("sample db", "/procdb", &body)
 }
 
 async fn procdb_add(State(st): State<Arc<AppState>>, Form(req): Form<ProcDbAddRequest>) -> Redirect {
@@ -2198,7 +2198,7 @@ async fn remotebox_page(State(st): State<Arc<AppState>>) -> Html<String> {
     };
 
     let body = format!(
-        "<h1>Remote Box</h1>\
+        "<h1>Sandbox</h1>\
          <p class=dim>Configure remote sandbox endpoints for dynamic analysis.</p>\
          <div class=card><div class=scroll><table>\
          <tr><th>name</th><th>url</th><th>type</th><th>api key</th></tr>\
@@ -2223,7 +2223,7 @@ async fn remotebox_page(State(st): State<Arc<AppState>>) -> Html<String> {
          </select></p>\
          <button class=btn type=submit>Add endpoint</button></form></div>"
     );
-    layout("remote box", "/remotebox", &body)
+    layout("sandbox", "/remotebox", &body)
 }
 
 async fn remotebox_add(State(st): State<Arc<AppState>>, Form(req): Form<RemoteBoxAddRequest>) -> Redirect {
