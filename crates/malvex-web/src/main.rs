@@ -219,7 +219,7 @@ fn layout(title: &str, active: &str, body: &str) -> Html<String> {
         "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">\
          <title>{title} — Malvex</title><style>{STYLE}</style>\
          <body><div class=wrap>\
-         <nav><a class=brand href=\"/\">Malvex<span class=dot></span></a><a href=\"/\">Investigator</a><a href=\"/sessions\">Sessions</a><a href=\"/threatintel\">IOC Feed</a><a href=\"/eventscan\">YARA Scan</a><a href=\"/lookup\">Intel Lookup</a><a href=\"/procdb\">Sample DB</a><a href=\"/remotebox\">Sandbox</a><a href=\"/store\">Store</a><a href=\"/schedule\">Schedules</a><a href=\"/settings\">Settings</a></nav>\
+         <nav><a class=brand href=\"/\">Malvex<span class=dot></span></a><a href=\"/\">Investigator</a><a href=\"/sessions\">Sessions</a><a href=\"/settings\">Settings</a></nav>\
          {body}\
          </div></body>",
     ))
@@ -527,8 +527,6 @@ tr:hover td{background:var(--panel2)}
   <div class="brand"><span class="dot"></span>malvex</div>
   <span class="sep"></span>
   <a href="/sessions">sessions</a>
-  <a href="/store">store</a>
-  <a href="/schedule">schedules</a>
   <a href="/settings">settings</a>
   <span class="file-info" id="file-info">no binary loaded</span>
 </header>
