@@ -133,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/doctor", get(api_doctor))
         .route("/api/session/:id", get(api_session))
         .route("/terminal", post(terminal))
+        .route("/api/prompt", post(api_prompt))
         .route(
             "/upload",
             post(upload).layer(axum::extract::DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
@@ -532,6 +533,99 @@ async fn terminal(State(st): State<Arc<AppState>>, Form(req): Form<TerminalReque
     }
 }
 
+#[derive(serde::Deserialize)]
+struct PromptRequest { prompt: String, #[serde(default)] runtime: String, #[serde(default)] model: String }
+
+#[derive(serde::Serialize)]
+struct PromptResponse { ok: bool, reply: String, #[serde(skip_serializing_if = "Option::is_none")] tool_output: Option<String> }
+
+async fn api_prompt(State(st): State<Arc<AppState>>, Json(req): Json<PromptRequest>) -> Json<PromptResponse> {
+    let prompt = req.prompt.trim().to_string();
+    if prompt.is_empty() || prompt.len() > 8000 {
+        return Json(PromptResponse { ok: false, reply: "prompt must be 1-8000 chars".into(), tool_output: None });
+    }
+    let lower = prompt.to_ascii_lowercase();
+
+    // Direct tool invocations: "run <tool> <target>" or "tool <name> <target>"
+    if lower.starts_with("run ") || lower.starts_with("tool ") {
+        let parts: Vec<&str> = prompt.splitn(3, ' ').collect();
+        if parts.len() >= 3 {
+            let tool_name = parts[1];
+            let target = parts[2].trim_matches(['\'', '"', '`']);
+            if let Some(runner) = malvex_tools::find_runner(tool_name) {
+                let path = std::path::Path::new(target);
+                if path.is_file() {
+                    let out = runner.run(path, &serde_json::Value::Null);
+                    return Json(PromptResponse {
+                        ok: out.success,
+                        reply: format!("[{}] {}", tool_name, if out.success { "completed" } else { "failed" }),
+                        tool_output: Some(serde_json::to_string_pretty(&out).unwrap_or_default()),
+                    });
+                }
+                return Json(PromptResponse { ok: false, reply: format!("file not found: {target}"), tool_output: None });
+            }
+        }
+    }
+
+    // Doctor check
+    if lower.contains("doctor") || lower.contains("health") || lower.contains("tools") {
+        let tools = malvex_doctor::scan(malvex_core::Platform::current());
+        let available = tools.iter().filter(|t| t.present).count();
+        let list: Vec<String> = tools.iter().map(|t| format!("{} {}{}", if t.present {"✓"} else {"✗"}, t.name, if t.via_mcp.is_some() {" (MCP)"} else {""})).collect();
+        return Json(PromptResponse { ok: true, reply: format!("Tool health: {}/{} available\n\n{}", available, tools.len(), list.join("\n")), tool_output: None });
+    }
+
+    // Hash a file
+    if (lower.starts_with("hash ") || lower.starts_with("identify ")) && prompt.split_whitespace().count() <= 3 {
+        let target = prompt.split_whitespace().last().unwrap_or("").trim_matches(['\'', '"', '`', '@']);
+        let path = std::path::Path::new(target);
+        if path.is_file() {
+            if let Some(runner) = malvex_tools::find_runner("hashing") {
+                let out = runner.run(path, &serde_json::Value::Null);
+                return Json(PromptResponse { ok: out.success, reply: format!("File hashes for {target}"), tool_output: Some(serde_json::to_string_pretty(&out).unwrap_or_default()) });
+            }
+        }
+    }
+
+    // List available tools
+    if lower.contains("list tool") || lower.contains("available tool") || lower == "tools" {
+        let runners = malvex_tools::all_runners();
+        let list: Vec<String> = runners.iter().map(|r| format!("{} {}", if r.is_available() {"✓"} else {"✗"}, r.name())).collect();
+        return Json(PromptResponse { ok: true, reply: format!("{} tools registered:\n\n{}", runners.len(), list.join("\n")), tool_output: None });
+    }
+
+    // Pipeline dry-run on referenced file
+    if lower.contains("analyze") || lower.contains("scan") || lower.contains("pipeline") {
+        let file_ref = prompt.split_whitespace().find(|w| w.starts_with('@') || std::path::Path::new(w).is_file());
+        if let Some(target) = file_ref {
+            let clean = target.trim_start_matches('@').trim_matches(['\'', '"', '`']);
+            let path = std::path::Path::new(clean);
+            if path.is_file() {
+                let bin = st.root.join("target/release/malvex");
+                if bin.is_file() {
+                    let output = tokio::time::timeout(Duration::from_secs(120), tokio::process::Command::new(&bin)
+                        .args(["run", clean, "--dry-run"])
+                        .current_dir(&st.root).output()).await;
+                    match output {
+                        Ok(Ok(out)) => {
+                            let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+                            return Json(PromptResponse { ok: out.status.success(), reply: format!("Pipeline dry-run on {clean}"), tool_output: Some(text.chars().take(20000).collect()) });
+                        }
+                        _ => return Json(PromptResponse { ok: false, reply: "pipeline timed out or failed to spawn".into(), tool_output: None }),
+                    }
+                }
+            }
+        }
+    }
+
+    // Free-form: forward to runtime if available, otherwise echo as pending
+    Json(PromptResponse {
+        ok: true,
+        reply: format!("Prompt received. In headless mode, pipe to your AI runtime:\n\n```\nmalvex prompt \"{}\"\n```\n\nOr attach a sample file for full pipeline analysis.", prompt.chars().take(200).collect::<String>()),
+        tool_output: None,
+    })
+}
+
 async fn index() -> Html<String> {
     Html(REPL_PAGE.to_string())
 }
@@ -763,10 +857,16 @@ document.getElementById('composer').addEventListener('submit',async e=>{
     else if(cmd==='/doctor'){addMsg('user',cmd);const r=await fetch('/api/doctor');const data=await r.json();const ok=data.filter(x=>x.present).length;addMsg('malvex','Tool health: '+ok+'/'+data.length+' available\n\n'+data.map(x=>(x.present?'✓':'✗')+' '+x.name+(x.via_mcp?' (MCP)':'')).join('\n'))}
     return;
   }
-  if(!input.files.length&&!/@[^\s]+/.test(prompt.value)){
+  if(!input.files.length){
     e.preventDefault();
     if(!prompt.value.trim()){addMsg('malvex','Type a prompt or attach a file to begin.');return;}
-    addMsg('user',prompt.value);addMsg('malvex','Attach a file with + Attach or reference one with @path/to/sample to start analysis.\nSupported: PE, ELF, Mach-O, PDF, DOC/DOCX, XLS/XLSX, PPT/PPTX, RTF, scripts, installers.');prompt.value='';return;
+    const text=prompt.value;addMsg('user',text);prompt.value='';
+    try{
+      const r=await fetch('/api/prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:text,runtime:document.querySelector('[name=runtime]')?.value||'claude',model:document.querySelector('[name=model]')?.value||''})});
+      const data=await r.json();
+      addMsg('malvex',data.reply+(data.tool_output?'\n\n```\n'+data.tool_output+'\n```':''));
+    }catch(err){addMsg('malvex','Error: '+err.message)}
+    return;
   }
   addMsg('user',prompt.value);
 });

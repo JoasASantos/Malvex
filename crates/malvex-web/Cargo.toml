@@ -12,6 +12,7 @@ path = "src/main.rs"
 malvex-core = { path = "../malvex-core" }
 malvex-orchestrator = { path = "../malvex-orchestrator" }
 malvex-doctor = { path = "../malvex-doctor" }
+malvex-tools = { path = "../malvex-tools" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

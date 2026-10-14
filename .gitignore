@@ -30,7 +30,14 @@ Cargo.lock
 *.pdf
 /dist/
 
+# Allow test samples (synthetic, safe for version control)
+!test-samples/*.exe
+!test-samples/*.pdf
+!test-samples/*.elf
+!test-samples/*.com
+
 # OS / editor
 .DS_Store
 *.swp
 .claude/
+.playwright-mcp/

