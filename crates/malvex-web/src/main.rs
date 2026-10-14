@@ -593,11 +593,36 @@ Example prompts:
     <div class="compose-bar">
       <button class="cbtn" type="button" id="attach-btn">+ Attach</button>
       <span class="file-label" id="filename">no artifact</span>
-      <select class="cbtn" name="runtime"><option value="claude">Claude</option><option value="codex">Codex</option><option value="custom">Custom</option><option value="hermes">Hermes</option><option value="ollama">Ollama</option></select>
+      <select class="cbtn" name="runtime" title="AI runtime">
+        <option value="claude">Claude</option>
+        <option value="codex">Codex</option>
+        <option value="custom">Custom</option>
+        <option value="hermes">Hermes</option>
+        <option value="ollama">Ollama</option>
+      </select>
+      <select class="cbtn" name="models" multiple title="Models (first=primary, rest=fallback)" style="min-width:140px;height:auto">
+        <option value="claude-opus-5-5" selected>Opus 5.5</option>
+        <option value="claude-sonnet-5-5">Sonnet 5.5</option>
+        <option value="claude-fable-5-1">Fable 5.1</option>
+        <option value="claude-haiku-4-5">Haiku 4.5</option>
+        <option value="gpt-5">GPT-5</option>
+        <option value="custom">Custom</option>
+      </select>
+      <select class="cbtn" name="parallel" title="Parallel agents">
+        <option value="1">1 agent</option>
+        <option value="2">2 agents</option>
+        <option value="3" selected>3 agents</option>
+        <option value="4">4 agents</option>
+        <option value="5">5 agents</option>
+      </select>
+      <select class="cbtn" name="approval_mode" title="Approval mode">
+        <option value="confirm-risky">Approve risky</option>
+        <option value="auto">Auto</option>
+        <option value="human">Human-in-loop</option>
+      </select>
       <button class="cbtn" type="submit" name="mode" value="dry">Plan</button>
       <button class="cbtn primary" type="submit" name="mode" value="real" id="run">Run ↗</button>
     </div>
-    <input type="hidden" name="parallel" value="3">
   </form>
 </section>
 </div>
@@ -626,7 +651,9 @@ document.getElementById('composer').addEventListener('submit',async e=>{
     return;
   }
   if(!input.files.length&&!/@[^\s]+/.test(prompt.value)){
-    e.preventDefault();addMsg('user',prompt.value);addMsg('malvex','Attach a binary with + Attach or reference one with @path/to/sample to start analysis.');prompt.value='';return;
+    e.preventDefault();
+    if(!prompt.value.trim()){addMsg('malvex','Type a prompt or attach a file to begin.');return;}
+    addMsg('user',prompt.value);addMsg('malvex','Attach a file with + Attach or reference one with @path/to/sample to start analysis.\nSupported: PE, ELF, Mach-O, PDF, DOC/DOCX, XLS/XLSX, PPT/PPTX, RTF, scripts, installers.');prompt.value='';return;
   }
   addMsg('user',prompt.value);
 });
@@ -745,6 +772,25 @@ footer{padding:1.25rem;text-align:center;color:#a5a5a5;font-size:.8rem}
       Contexto / instruções pro analista (opcional)
       <textarea id=custom_prompt name=custom_prompt rows=3
         placeholder="ex: foca no mecanismo de update; assuma atacante com acesso físico ao device; esse build não tem CEF, ignora vetores de web frontend..."></textarea>
+    </label>
+    <label class=parallel-row>Runtime
+      <select name=runtime>
+        <option value=claude selected>Claude</option>
+        <option value=codex>Codex</option>
+        <option value=custom>Custom</option>
+        <option value=hermes>Hermes</option>
+        <option value=ollama>Ollama</option>
+      </select>
+    </label>
+    <label class=parallel-row>Modelo
+      <select name=models multiple style="height:80px">
+        <option value=claude-opus-5-5 selected>Opus 5.5</option>
+        <option value=claude-sonnet-5-5>Sonnet 5.5</option>
+        <option value=claude-fable-5-1>Fable 5.1</option>
+        <option value=claude-haiku-4-5>Haiku 4.5</option>
+        <option value=gpt-5>GPT-5</option>
+        <option value=custom>Custom</option>
+      </select>
     </label>
     <div class=actions>
       <button class=btn-ghost type=submit name=mode value=dry id=btn-dry disabled>Planejar análise</button>
