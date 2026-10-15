@@ -409,6 +409,27 @@ async fn settings_page() -> Html<String> {
     <div class=card><h3>Approval Policy</h3><p>Auto mode · Approve risky actions · Human in the loop</p>
     <p class=dim>Destructive commands blocked by REPL safety policy.</p></div>
 
+    <div class=card><h3>Tool Setup</h3>
+    <p>Automated installers for all analysis tools. Run the script for your platform:</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:12px 0">
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:16px">
+        <p style="margin:0 0 8px;font-weight:700">🍎 macOS</p>
+        <code style="font-size:.85rem;display:block;margin-bottom:8px">bash setup/install-macos.sh</code>
+        <p class=dim style="margin:0;font-size:.8rem">Homebrew + pip + GitHub releases</p>
+      </div>
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:16px">
+        <p style="margin:0 0 8px;font-weight:700">🐧 Linux</p>
+        <code style="font-size:.85rem;display:block;margin-bottom:8px">bash setup/install-linux.sh</code>
+        <p class=dim style="margin:0;font-size:.8rem">apt/dnf/pacman + pip + Ghidra</p>
+      </div>
+      <div style="background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:16px">
+        <p style="margin:0 0 8px;font-weight:700">🪟 Windows</p>
+        <code style="font-size:.85rem;display:block;margin-bottom:8px">powershell setup\install-windows.ps1</code>
+        <p class=dim style="margin:0;font-size:.8rem">Chocolatey + pip + Sysinternals</p>
+      </div>
+    </div>
+    <p class=dim>After install, run <code>malvex doctor</code> to verify.</p></div>
+
     <div class=card><h3>Workspace</h3><p><code>/opt/MalvexAI</code></p>
     <a class='btn' href='/'>Investigator</a> <a class='btn ghost' href='/api/doctor'>Tool health</a></div>"##;
     layout("settings", "/settings", body)
