@@ -840,6 +840,7 @@ function showDebugTab(btn,id){
   document.querySelectorAll('.dtab').forEach(t=>t.classList.remove('active'));
   btn.classList.add('active');
 }
+function apiUrl(path){const l=location;return l.protocol+'//'+l.hostname+(l.port?':'+l.port:'')+path}
 const input=document.getElementById('binary'),nameEl=document.getElementById('filename'),thread=document.getElementById('thread'),prompt=document.getElementById('prompt');
 const chatKey='malvex-repl-history';let chat;try{chat=JSON.parse(localStorage.getItem(chatKey))||{messages:[]}}catch(e){chat={messages:[]}}
 document.getElementById('attach-btn').addEventListener('click',()=>input.click());
@@ -848,13 +849,13 @@ document.getElementById('composer').addEventListener('submit',async e=>{
   if(prompt.value.trim().startsWith('!')){
     e.preventDefault();const command=prompt.value;
     addMsg('user',command);prompt.value='';
-    const r=await fetch('/terminal',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command})});
+    const r=await fetch(apiUrl('/terminal'),{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({command})});
     const data=await r.json();addMsg('tool',data.output||'(no output)');return;
   }
   if(prompt.value.trim().startsWith('/')){
     e.preventDefault();const cmd=prompt.value.trim();prompt.value='';
     if(cmd==='/clear'){thread.innerHTML='';chat.messages=[];try{localStorage.setItem(chatKey,JSON.stringify(chat))}catch(e){}}
-    else if(cmd==='/doctor'){addMsg('user',cmd);const r=await fetch('/api/doctor');const data=await r.json();const ok=data.filter(x=>x.present).length;addMsg('malvex','Tool health: '+ok+'/'+data.length+' available\n\n'+data.map(x=>(x.present?'✓':'✗')+' '+x.name+(x.via_mcp?' (MCP)':'')).join('\n'))}
+    else if(cmd==='/doctor'){addMsg('user',cmd);const r=await fetch(apiUrl('/api/doctor'));const data=await r.json();const ok=data.filter(x=>x.present).length;addMsg('malvex','Tool health: '+ok+'/'+data.length+' available\n\n'+data.map(x=>(x.present?'✓':'✗')+' '+x.name+(x.via_mcp?' (MCP)':'')).join('\n'))}
     return;
   }
   if(!input.files.length){
@@ -862,7 +863,7 @@ document.getElementById('composer').addEventListener('submit',async e=>{
     if(!prompt.value.trim()){addMsg('malvex','Type a prompt or attach a file to begin.');return;}
     const text=prompt.value;addMsg('user',text);prompt.value='';
     try{
-      const r=await fetch('/api/prompt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:text,runtime:document.querySelector('[name=runtime]')?.value||'claude',model:document.querySelector('[name=model]')?.value||''})});
+      const r=await fetch(apiUrl('/api/prompt'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:text,runtime:document.querySelector('[name=runtime]')?.value||'claude',model:document.querySelector('[name=model]')?.value||''})});
       const data=await r.json();
       addMsg('malvex',data.reply+(data.tool_output?'\n\n```\n'+data.tool_output+'\n```':''));
     }catch(err){addMsg('malvex','Error: '+err.message)}
@@ -882,7 +883,7 @@ const activeSession=new URLSearchParams(location.search).get('session');
 if(activeSession){
   document.getElementById('upload-area').classList.add('hidden');
   document.getElementById('binary-overview').classList.remove('hidden');
-  const refreshLive=async()=>{const r=await fetch('/api/session/'+encodeURIComponent(activeSession));if(!r.ok)return;const x=await r.json();
+  const refreshLive=async()=>{const r=await fetch(apiUrl('/api/session/'+encodeURIComponent(activeSession)));if(!r.ok)return;const x=await r.json();
     document.getElementById('progress-fill').style.width=x.percent+'%';
     document.getElementById('session-log').textContent=(x.tail||[]).join('\n');
     if(!x.done)setTimeout(refreshLive,1500)};
