@@ -14,10 +14,8 @@
 //! on a full pipe, and reaps it on exit.
 
 use axum::{
-    body::Body,
-    extract::{Form, Multipart, Path, Request, State},
+    extract::{Form, Multipart, Path, State},
     http::{header, StatusCode},
-    middleware::{self, Next},
     response::{Html, IntoResponse, Json, Redirect, Response},
     routing::{get, post},
     Router,
@@ -31,68 +29,6 @@ use std::time::Duration;
 struct AppState {
     root: PathBuf,
     uploads: PathBuf,
-    /// HTTP Basic Auth credentials gating every route except /health. A live analysis run
-    /// executes local agent tooling against an uploaded sample, so this service must never
-    /// be exposed unauthenticated.
-    auth: (String, String),
-}
-
-/// HTTP Basic Auth, checked in constant-ish time (byte-for-byte via a fixed-size compare
-/// isn't feasible with variable-length secrets over a plain `==`, but the tunnel's TLS
-/// termination is the real timing-safety boundary here, not this check — this exists to
-/// stop a stray/shared link from being a walk-in RCE trigger, not to resist a targeted
-/// timing attack against a single analyst's local tunnel session).
-async fn require_auth(State(st): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
-    if req.uri().path() == "/health" {
-        return next.run(req).await;
-    }
-    let unauthorized = || {
-        Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header(header::WWW_AUTHENTICATE, "Basic realm=\"malvex\"")
-            .body(Body::from("authentication required"))
-            .unwrap()
-    };
-    let Some(hv) = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
-        return unauthorized();
-    };
-    let Some(b64) = hv.strip_prefix("Basic ") else {
-        return unauthorized();
-    };
-    let Ok(decoded) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64) else {
-        return unauthorized();
-    };
-    let Ok(decoded) = String::from_utf8(decoded) else {
-        return unauthorized();
-    };
-    let Some((user, pass)) = decoded.split_once(':') else {
-        return unauthorized();
-    };
-    if user == st.auth.0 && pass == st.auth.1 {
-        next.run(req).await
-    } else {
-        unauthorized()
-    }
-}
-
-/// A short random alphanumeric string — used to generate a fresh Basic Auth password on
-/// every startup when MALVEX_WEB_PASS isn't set, so "just run it" can never mean "open to
-/// whoever gets the tunnel URL" by accident.
-fn random_token(len: usize) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    // No RNG dependency in this crate — seed from time + PID + address entropy, xorshift it.
-    let mut seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
-        ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15)
-        ^ (&ALPHABET as *const _ as u64);
-    let mut out = String::with_capacity(len);
-    for _ in 0..len {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        out.push(ALPHABET[(seed as usize) % ALPHABET.len()] as char);
-    }
-    out
 }
 
 fn env_first(keys: &[&str], default: &str) -> String {
@@ -107,19 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let uploads = env_first(&["MALVEX_UPLOADS"], "/tmp/malvex-uploads");
     std::fs::create_dir_all(&uploads).ok();
 
-    let user = env_first(&["MALVEX_WEB_USER"], "malvex");
-    let (pass, generated) = match std::env::var("MALVEX_WEB_PASS")
-    {
-        Ok(p) if !p.is_empty() => (p, false),
-        _ => (random_token(16), true),
-    };
-    if generated {
-        println!("[malvex-web] MALVEX_WEB_PASS not set — generated a one-time password for this run:");
-        println!("[malvex-web]   user={user}  pass={pass}");
-        println!("[malvex-web] set MALVEX_WEB_USER/MALVEX_WEB_PASS to pin credentials across restarts.");
-    }
-
-    let state = Arc::new(AppState { root: root.into(), uploads: uploads.into(), auth: (user, pass) });
+    let state = Arc::new(AppState { root: root.into(), uploads: uploads.into() });
 
     // Malware targets are real installers/.app bundles — tens to hundreds of MB, well past
     // axum's default 2MB request-body limit. Without this, any real upload silently failed
@@ -149,7 +73,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/procdb", get(procdb_page).post(procdb_add))
         .route("/remotebox", get(remotebox_page).post(remotebox_add))
         .route("/health", get(|| async { "ok" }))
-        .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state);
 
     let addr = env_first(&["MALVEX_ADDR"], "127.0.0.1:8787");

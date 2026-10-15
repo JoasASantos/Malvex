@@ -18,7 +18,6 @@ serde.workspace = true
 serde_json.workspace = true
 axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "fs", "time"] }
-base64 = "0.22"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 walkdir = "2"
 regex = "1"
