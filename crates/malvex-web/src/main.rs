@@ -58,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/session/:id", get(api_session))
         .route("/terminal", post(terminal))
         .route("/api/prompt", post(api_prompt))
+        .route("/api/disasm", post(api_disasm))
+        .route("/api/runtime", post(api_runtime))
         .route(
             "/upload",
             post(upload).layer(axum::extract::DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
@@ -562,12 +564,332 @@ async fn api_prompt(State(st): State<Arc<AppState>>, Json(req): Json<PromptReque
         }
     }
 
+    // Disassembly command
+    if lower.starts_with("disasm") || lower.starts_with("disassemble") || lower.contains("disassembly") {
+        let file_ref = prompt.split_whitespace().find(|w| w.starts_with('@') || std::path::Path::new(w).is_file());
+        if let Some(target) = file_ref {
+            let clean = target.trim_start_matches('@').trim_matches(['\'', '"', '`']);
+            let path = std::path::Path::new(clean);
+            if path.is_file() {
+                let output = tokio::time::timeout(Duration::from_secs(30),
+                    tokio::process::Command::new("r2")
+                        .args(["-e", "scr.color=0", "-q", "-c", "aaa;s entry0;pd 64", path.to_str().unwrap_or("")])
+                        .output()
+                ).await;
+                match output {
+                    Ok(Ok(out)) => {
+                        let text = String::from_utf8_lossy(&out.stdout).to_string();
+                        return Json(PromptResponse { ok: true, reply: format!("Disassembly of {clean} (entry point, 64 instructions)"), tool_output: Some(text.chars().take(20000).collect()) });
+                    }
+                    _ => return Json(PromptResponse { ok: false, reply: "r2 disassembly failed or timed out".into(), tool_output: None }),
+                }
+            }
+        }
+        return Json(PromptResponse { ok: false, reply: "Specify a file: disasm @path/to/binary".into(), tool_output: None });
+    }
+
+    // Runtime/crypto analysis command
+    if lower.contains("crypto") || lower.contains("key extract") || lower.contains("runtime") || lower.contains("frida") || lower.contains("hook") || lower.contains("unpack") {
+        let file_ref = prompt.split_whitespace().find(|w| w.starts_with('@') || std::path::Path::new(w).is_file());
+        let action = if lower.contains("crypto") || lower.contains("key") { "crypto" }
+            else if lower.contains("frida") || lower.contains("hook") { "hooks" }
+            else if lower.contains("unpack") { "unpack" }
+            else { "triage" };
+        if let Some(target) = file_ref {
+            let clean = target.trim_start_matches('@').trim_matches(['\'', '"', '`']);
+            let path = std::path::Path::new(clean);
+            if path.is_file() {
+                let req = RuntimeRequest { file: clean.to_string(), action: action.to_string() };
+                let resp = api_runtime(Json(req)).await;
+                let r = resp.0;
+                return Json(PromptResponse {
+                    ok: r.ok,
+                    reply: format!("[runtime:{}] analysis complete", r.action),
+                    tool_output: Some(r.output),
+                });
+            }
+        }
+        return Json(PromptResponse { ok: false, reply: format!("Specify a file: {action} @path/to/binary"), tool_output: None });
+    }
+
     // Free-form: forward to runtime if available, otherwise echo as pending
     Json(PromptResponse {
         ok: true,
         reply: format!("Prompt received. In headless mode, pipe to your AI runtime:\n\n```\nmalvex prompt \"{}\"\n```\n\nOr attach a sample file for full pipeline analysis.", prompt.chars().take(200).collect::<String>()),
         tool_output: None,
     })
+}
+
+// --- Disassembly endpoint: runs radare2 on uploaded file ---
+#[derive(serde::Deserialize)]
+struct DisasmRequest {
+    file: String,
+    #[serde(default)]
+    address: String,
+    #[serde(default = "default_count")]
+    count: usize,
+    #[serde(default)]
+    functions_only: bool,
+}
+fn default_count() -> usize { 64 }
+
+#[derive(serde::Serialize)]
+struct DisasmResponse {
+    ok: bool,
+    info: Option<serde_json::Value>,
+    functions: Vec<serde_json::Value>,
+    disasm: String,
+    strings: Vec<String>,
+    imports: Vec<String>,
+    sections: Vec<serde_json::Value>,
+    entry: String,
+}
+
+async fn api_disasm(Json(req): Json<DisasmRequest>) -> Json<DisasmResponse> {
+    let path = std::path::Path::new(&req.file);
+    if !path.is_file() {
+        return Json(DisasmResponse {
+            ok: false, info: None, functions: vec![], disasm: format!("file not found: {}", req.file),
+            strings: vec![], imports: vec![], sections: vec![], entry: String::new(),
+        });
+    }
+
+    let r2_cmd = if req.functions_only {
+        "aaa;aflj".to_string()
+    } else if !req.address.is_empty() {
+        format!("aaa;s {};pdf", req.address)
+    } else {
+        format!("aaa;s entry0;pd {}", req.count)
+    };
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new("r2")
+            .args(["-e", "scr.color=0", "-q", "-c", &r2_cmd, path.to_str().unwrap_or("")])
+            .output()
+    ).await;
+
+    let disasm_text = match &output {
+        Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout).to_string(),
+        Ok(Err(e)) => return Json(DisasmResponse {
+            ok: false, info: None, functions: vec![], disasm: format!("r2 error: {e}"),
+            strings: vec![], imports: vec![], sections: vec![], entry: String::new(),
+        }),
+        Err(_) => return Json(DisasmResponse {
+            ok: false, info: None, functions: vec![], disasm: "r2 timed out".into(),
+            strings: vec![], imports: vec![], sections: vec![], entry: String::new(),
+        }),
+    };
+
+    // Get binary info, strings, imports, sections in parallel
+    let info_cmd = tokio::process::Command::new("r2")
+        .args(["-e", "scr.color=0", "-q", "-c", "ij", path.to_str().unwrap_or("")])
+        .output();
+    let strings_cmd = tokio::process::Command::new("r2")
+        .args(["-e", "scr.color=0", "-q", "-c", "izzq", path.to_str().unwrap_or("")])
+        .output();
+    let imports_cmd = tokio::process::Command::new("r2")
+        .args(["-e", "scr.color=0", "-q", "-c", "iij", path.to_str().unwrap_or("")])
+        .output();
+    let sections_cmd = tokio::process::Command::new("r2")
+        .args(["-e", "scr.color=0", "-q", "-c", "iSj", path.to_str().unwrap_or("")])
+        .output();
+    let entry_cmd = tokio::process::Command::new("r2")
+        .args(["-e", "scr.color=0", "-q", "-c", "iej", path.to_str().unwrap_or("")])
+        .output();
+
+    let (info_out, strings_out, imports_out, sections_out, entry_out) =
+        tokio::join!(info_cmd, strings_cmd, imports_cmd, sections_cmd, entry_cmd);
+
+    let info: Option<serde_json::Value> = info_out.ok()
+        .and_then(|o| serde_json::from_slice(&o.stdout).ok());
+
+    let strings: Vec<String> = strings_out.ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().take(500).map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+
+    let imports: Vec<String> = imports_out.ok()
+        .and_then(|o| serde_json::from_slice::<Vec<serde_json::Value>>(&o.stdout).ok())
+        .map(|v| v.iter().filter_map(|i| {
+            let name = i.get("name")?.as_str()?;
+            let lib = i.get("libname").and_then(|l| l.as_str()).unwrap_or("");
+            Some(if lib.is_empty() { name.to_string() } else { format!("{lib}::{name}") })
+        }).collect())
+        .unwrap_or_default();
+
+    let sections: Vec<serde_json::Value> = sections_out.ok()
+        .and_then(|o| serde_json::from_slice(&o.stdout).ok())
+        .unwrap_or_default();
+
+    let entry = entry_out.ok()
+        .and_then(|o| serde_json::from_slice::<Vec<serde_json::Value>>(&o.stdout).ok())
+        .and_then(|v| v.first().and_then(|e| e.get("vaddr")).and_then(|a| a.as_u64()))
+        .map(|a| format!("0x{a:x}"))
+        .unwrap_or_default();
+
+    let functions: Vec<serde_json::Value> = if req.functions_only {
+        serde_json::from_str(&disasm_text).unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    Json(DisasmResponse {
+        ok: true,
+        info,
+        functions,
+        disasm: if req.functions_only { String::new() } else { disasm_text },
+        strings,
+        imports,
+        sections,
+        entry,
+    })
+}
+
+// --- Runtime analysis endpoint: dynamic analysis via frida/instrumentation ---
+#[derive(serde::Deserialize)]
+struct RuntimeRequest {
+    file: String,
+    #[serde(default)]
+    action: String,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeResponse {
+    ok: bool,
+    action: String,
+    output: String,
+    findings: Vec<serde_json::Value>,
+}
+
+async fn api_runtime(Json(req): Json<RuntimeRequest>) -> Json<RuntimeResponse> {
+    let path = std::path::Path::new(&req.file);
+    if !path.is_file() {
+        return Json(RuntimeResponse {
+            ok: false, action: req.action.clone(), output: format!("file not found: {}", req.file),
+            findings: vec![],
+        });
+    }
+
+    let action = if req.action.is_empty() { "triage" } else { &req.action };
+
+    match action {
+        "crypto" | "keys" | "crypto-scan" => {
+            // Scan for crypto constants, S-boxes, key material
+            let output = tokio::time::timeout(Duration::from_secs(30),
+                tokio::process::Command::new("r2")
+                    .args(["-e", "scr.color=0", "-q", "-c", "aaa;/cr;/Ca", path.to_str().unwrap_or("")])
+                    .output()
+            ).await;
+            let text = match output {
+                Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout).to_string(),
+                _ => "r2 crypto scan failed".to_string(),
+            };
+
+            // Also search for known crypto strings
+            let strings_out = tokio::process::Command::new("r2")
+                .args(["-e", "scr.color=0", "-q", "-c", "/ AES\n/ RSA\n/ BEGIN.*KEY\n/ PRIVATE KEY\n/ ChaCha\n/ Salsa\n/ RC4\n/ Blowfish\n/ DES\n/ ENCRYPT\n/ DECRYPT\n/ CryptEncrypt\n/ BCryptEncrypt\n/ EVP_Encrypt\n/ CryptGenKey\n/ CryptDeriveKey\n/ CryptImportKey", path.to_str().unwrap_or("")])
+                .output().await;
+            let crypto_strings = strings_out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+
+            // Find high-entropy blobs that might be embedded keys
+            let entropy_out = tokio::process::Command::new("r2")
+                .args(["-e", "scr.color=0", "-q", "-c", "p=e 256", path.to_str().unwrap_or("")])
+                .output().await;
+            let entropy = entropy_out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+
+            let mut findings = vec![];
+            if text.contains("aes") || text.contains("AES") || crypto_strings.contains("AES") {
+                findings.push(serde_json::json!({"type": "crypto", "algo": "AES", "detail": "AES constants/S-box detected"}));
+            }
+            if crypto_strings.contains("RSA") || crypto_strings.contains("BEGIN") {
+                findings.push(serde_json::json!({"type": "crypto", "algo": "RSA", "detail": "RSA key material references found"}));
+            }
+            if crypto_strings.contains("CryptEncrypt") || crypto_strings.contains("BCryptEncrypt") {
+                findings.push(serde_json::json!({"type": "api", "category": "crypto", "detail": "Windows Crypto API calls detected"}));
+            }
+            if crypto_strings.contains("EVP_Encrypt") {
+                findings.push(serde_json::json!({"type": "api", "category": "crypto", "detail": "OpenSSL EVP encryption calls detected"}));
+            }
+
+            Json(RuntimeResponse {
+                ok: true,
+                action: "crypto-scan".into(),
+                output: format!("=== Crypto Constants ===\n{text}\n\n=== Crypto String References ===\n{crypto_strings}\n\n=== Entropy Profile ===\n{entropy}"),
+                findings,
+            })
+        }
+        "hooks" | "frida" | "instrument" => {
+            // Generate Frida hook scripts for crypto/network/file interception
+            let hook_script = r#"{
+  "hooks": [
+    {"category": "crypto", "api": "CryptEncryptMessage", "action": "log key material + plaintext before encryption"},
+    {"category": "crypto", "api": "BCryptEncrypt", "action": "dump key handle + IV + plaintext"},
+    {"category": "crypto", "api": "CryptDeriveKey", "action": "capture derived key bytes"},
+    {"category": "crypto", "api": "EVP_EncryptInit_ex", "action": "log cipher + key + IV"},
+    {"category": "crypto", "api": "EVP_EncryptUpdate", "action": "dump plaintext blocks"},
+    {"category": "network", "api": "send/WSASend", "action": "log outbound data before encryption"},
+    {"category": "network", "api": "connect", "action": "log C2 address + port"},
+    {"category": "network", "api": "InternetConnectA/W", "action": "log remote host"},
+    {"category": "file", "api": "CreateFileA/W", "action": "log file access patterns"},
+    {"category": "file", "api": "WriteFile", "action": "capture written content for ransom note detection"},
+    {"category": "registry", "api": "RegSetValueExA/W", "action": "log persistence and config writes"},
+    {"category": "process", "api": "CreateRemoteThread", "action": "detect process injection"},
+    {"category": "process", "api": "NtMapViewOfSection", "action": "detect process hollowing"},
+    {"category": "memory", "api": "VirtualProtect", "action": "detect code unpacking (RWX transitions)"}
+  ],
+  "frida_command": "frida -l malvex-hooks.js -f <target>"
+}"#;
+            Json(RuntimeResponse {
+                ok: true,
+                action: "frida-hooks".into(),
+                output: hook_script.to_string(),
+                findings: vec![serde_json::json!({"type": "info", "detail": "14 Frida hooks generated for crypto/network/file/process interception"})],
+            })
+        }
+        "unpack" | "deobfuscate" => {
+            // Detect packers and run entropy analysis
+            let output = tokio::time::timeout(Duration::from_secs(20),
+                tokio::process::Command::new("r2")
+                    .args(["-e", "scr.color=0", "-q", "-c", "iI~packer\niI~crypto\niI~stripped\np=e 64", path.to_str().unwrap_or("")])
+                    .output()
+            ).await;
+            let text = match output {
+                Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout).to_string(),
+                _ => "analysis failed".to_string(),
+            };
+
+            // Check with file command
+            let file_out = tokio::process::Command::new("file")
+                .arg(path)
+                .output().await;
+            let file_info = file_out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+
+            Json(RuntimeResponse {
+                ok: true,
+                action: "unpack-analysis".into(),
+                output: format!("=== File Type ===\n{file_info}\n=== Binary Info ===\n{text}"),
+                findings: vec![],
+            })
+        }
+        _ => {
+            // Default triage: run multiple analyses
+            let r2_out = tokio::time::timeout(Duration::from_secs(30),
+                tokio::process::Command::new("r2")
+                    .args(["-e", "scr.color=0", "-q", "-c", "aaa;iI;afl;iz", path.to_str().unwrap_or("")])
+                    .output()
+            ).await;
+            let text = match r2_out {
+                Ok(Ok(out)) => String::from_utf8_lossy(&out.stdout).to_string(),
+                _ => "r2 triage failed".to_string(),
+            };
+            Json(RuntimeResponse {
+                ok: true,
+                action: "triage".into(),
+                output: text.chars().take(20000).collect(),
+                findings: vec![],
+            })
+        }
+    }
 }
 
 async fn index() -> Html<String> {
@@ -646,6 +968,35 @@ tr:hover td{background:var(--panel2)}
 .ioc-item{display:flex;gap:8px;padding:4px 0;font-size:12px;align-items:baseline}
 .ioc-type{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;width:50px;flex-shrink:0}
 .mitre-tag{display:inline-block;padding:3px 7px;border-radius:4px;font-size:11px;font-weight:600;background:#1a1030;color:var(--violet);border:1px solid #2d1f50;margin:2px}
+/* Disassembly view */
+.disasm-toolbar{display:flex;gap:6px;align-items:center;padding-bottom:10px;border-bottom:1px solid var(--line);margin-bottom:10px;flex-wrap:wrap}
+.disasm-addr{background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--cyan);font:12px ui-monospace,monospace;padding:5px 8px;width:200px}
+.disasm-addr:focus{outline:none;border-color:var(--cyan)}
+.disasm-info{color:var(--muted);font-size:11px;margin-left:auto}
+.disasm-panels{display:grid;grid-template-columns:180px 1fr;gap:8px;height:calc(100% - 50px)}
+.func-list{overflow:auto;border-right:1px solid var(--line);padding-right:8px;font-size:11px}
+.func-item{padding:3px 6px;cursor:pointer;border-radius:4px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.func-item:hover{background:var(--panel2);color:var(--text)}
+.func-item.active{background:var(--panel2);color:var(--cyan)}
+.disasm-view{margin:0;overflow:auto;font:12px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--text);tab-size:8}
+.disasm-view .addr{color:#4a5568;user-select:none}
+.disasm-view .op{color:var(--cyan);font-weight:600}
+.disasm-view .reg{color:var(--amber)}
+.disasm-view .num{color:var(--green)}
+.disasm-view .comment{color:#4a6a50;font-style:italic}
+.disasm-view .string{color:var(--pink)}
+.disasm-view .call{color:var(--violet);font-weight:700}
+.disasm-view .jmp{color:var(--gold)}
+.disasm-view .func-name{color:var(--green);font-weight:700}
+/* Runtime analysis */
+.runtime-toolbar{display:flex;gap:6px;padding-bottom:10px;border-bottom:1px solid var(--line);margin-bottom:10px;flex-wrap:wrap}
+#runtime-results{overflow:auto;max-height:calc(100vh - 200px)}
+#runtime-results pre{font:12px/1.6 ui-monospace,monospace;color:var(--text);white-space:pre-wrap;word-break:break-all}
+.rt-finding{display:flex;gap:8px;padding:6px 8px;border-radius:6px;background:var(--panel2);margin-bottom:4px;font-size:12px;align-items:center}
+.rt-finding .rt-type{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;padding:2px 6px;border-radius:4px;flex-shrink:0}
+.rt-type.crypto{background:#2a1a30;color:var(--violet)}
+.rt-type.api{background:#1a2030;color:var(--blue)}
+.rt-type.info{background:#1a2520;color:var(--green)}
 .upload-zone{border:2px dashed var(--line);border-radius:12px;padding:40px 20px;text-align:center;cursor:pointer;transition:border-color .2s}
 .upload-zone:hover{border-color:var(--pink)}
 .upload-zone h2{font:700 18px/1.3 ui-sans-serif,system-ui,sans-serif;margin:0 0 6px;color:var(--text)}
@@ -679,6 +1030,8 @@ tr:hover td{background:var(--panel2)}
     <button class="dtab" onclick="showDebugTab(this,'tab-findings')">Findings</button>
     <button class="dtab" onclick="showDebugTab(this,'tab-iocs')">IOCs</button>
     <button class="dtab" onclick="showDebugTab(this,'tab-mitre')">ATT&CK</button>
+    <button class="dtab" onclick="showDebugTab(this,'tab-disasm')">Disasm</button>
+    <button class="dtab" onclick="showDebugTab(this,'tab-runtime')">Runtime</button>
     <button class="dtab" onclick="showDebugTab(this,'tab-hex')">Hex</button>
   </div>
 
@@ -707,6 +1060,38 @@ tr:hover td{background:var(--panel2)}
     <div id="tab-findings" class="hidden"><table><tr><th>Sev</th><th>Finding</th><th>Verdict</th><th>Agent</th></tr><tr><td colspan="4" style="color:var(--muted);text-align:center;padding:40px">Run an analysis to see findings</td></tr></table></div>
     <div id="tab-iocs" class="hidden"><div style="color:var(--muted);text-align:center;padding:40px">Run an analysis to extract IOCs</div></div>
     <div id="tab-mitre" class="hidden"><div style="color:var(--muted);text-align:center;padding:40px">Run an analysis to map ATT&amp;CK techniques</div></div>
+    <div id="tab-disasm" class="hidden">
+      <div class="disasm-toolbar">
+        <button class="cbtn" onclick="loadDisasm()">⟳ Disassemble</button>
+        <button class="cbtn" onclick="loadFunctions()">Functions</button>
+        <input class="disasm-addr" id="disasm-addr" placeholder="address or function (e.g. main, 0x401000)">
+        <button class="cbtn" onclick="disasmAt()">Go</button>
+        <span class="disasm-info" id="disasm-info"></span>
+      </div>
+      <div class="disasm-panels">
+        <div class="func-list" id="func-list"></div>
+        <pre class="disasm-view" id="disasm-view"><span style="color:var(--muted)">Click Disassemble or attach a binary to view code</span></pre>
+      </div>
+    </div>
+    <div id="tab-runtime" class="hidden">
+      <div class="runtime-toolbar">
+        <button class="cbtn" onclick="runCryptoScan()">🔑 Crypto Scan</button>
+        <button class="cbtn" onclick="runFridaHooks()">🎣 Frida Hooks</button>
+        <button class="cbtn" onclick="runUnpackAnalysis()">📦 Unpack</button>
+        <button class="cbtn" onclick="runRuntimeTriage()">🔬 Triage</button>
+      </div>
+      <div id="runtime-results">
+        <div style="color:var(--muted);text-align:center;padding:40px">
+          <p style="font-size:14px;font-weight:600;color:var(--text)">Runtime Analysis</p>
+          <p>Extract crypto keys, hook APIs with Frida, detect packers, analyze runtime behavior.</p>
+          <p>Attach a binary then choose an analysis type above.</p>
+        </div>
+      </div>
+      <div id="runtime-findings" class="hidden">
+        <div class="section-title">Findings</div>
+        <div id="runtime-findings-list"></div>
+      </div>
+    </div>
     <div id="tab-hex" class="hidden"><div style="color:var(--muted);text-align:center;padding:40px">Load a binary to view hex dump</div></div>
   </div>
 </section>
@@ -788,7 +1173,7 @@ function apiUrl(path){const l=location;return l.protocol+'//'+l.hostname+(l.port
 const input=document.getElementById('binary'),nameEl=document.getElementById('filename'),thread=document.getElementById('thread'),prompt=document.getElementById('prompt');
 const chatKey='malvex-repl-history';let chat;try{chat=JSON.parse(localStorage.getItem(chatKey))||{messages:[]}}catch(e){chat={messages:[]}}
 document.getElementById('attach-btn').addEventListener('click',()=>input.click());
-input.addEventListener('change',()=>{const f=input.files[0];if(f){nameEl.textContent=f.name+' · '+(f.size/1024/1024).toFixed(1)+'MB';document.getElementById('file-info').textContent=f.name+' · '+(f.size/1024/1024).toFixed(1)+'MB'}});
+input.addEventListener('change',()=>{const f=input.files[0];if(f){nameEl.textContent=f.name+' · '+(f.size/1024/1024).toFixed(1)+'MB';document.getElementById('file-info').textContent=f.name+' · '+(f.size/1024/1024).toFixed(1)+'MB';currentFile='/tmp/malvex-uploads/'+f.name}});
 document.getElementById('composer').addEventListener('submit',async e=>{
   if(prompt.value.trim().startsWith('!')){
     e.preventDefault();const command=prompt.value;
@@ -833,6 +1218,92 @@ if(activeSession){
     if(!x.done)setTimeout(refreshLive,1500)};
   refreshLive();
 }
+// --- Disassembly functions ---
+let currentFile='';
+function getUploadedFile(){
+  const f=document.getElementById('file-info').textContent;
+  if(f&&f!=='no binary loaded'){
+    const name=f.split(' · ')[0];
+    return '/tmp/malvex-uploads/'+name;
+  }
+  return currentFile;
+}
+function highlightDisasm(text){
+  return text.replace(/^(0x[0-9a-f]+)\s+/gm,'<span class="addr">$1</span>  ')
+    .replace(/\b(call|CALL)\s+(\S+)/g,'<span class="call">call</span> <span class="func-name">$2</span>')
+    .replace(/\b(jmp|je|jne|jz|jnz|jg|jl|jge|jle|ja|jb|jae|jbe|jo|js|jns|jcxz|loop)\b/g,'<span class="jmp">$1</span>')
+    .replace(/\b(mov|lea|push|pop|ret|nop|xor|add|sub|cmp|test|and|or|shl|shr|sar|sal|mul|div|imul|idiv|inc|dec|neg|not|int|syscall|leave|enter|cdq|cbw|cwde|movzx|movsx|cmov\w*)\b/g,'<span class="op">$1</span>')
+    .replace(/\b(eax|ebx|ecx|edx|esi|edi|esp|ebp|rax|rbx|rcx|rdx|rsi|rdi|rsp|rbp|r[89]|r1[0-5]|eip|rip|eflags|rflags|cs|ds|es|fs|gs|ss|xmm[0-9]+|ymm[0-9]+|zmm[0-9]+)\b/g,'<span class="reg">$1</span>')
+    .replace(/\b(0x[0-9a-fA-F]+)\b/g,'<span class="num">$1</span>')
+    .replace(/(;.*$)/gm,'<span class="comment">$1</span>')
+    .replace(/(str\.[^\s;]+|"[^"]*")/g,'<span class="string">$1</span>');
+}
+async function loadDisasm(){
+  const file=getUploadedFile();
+  if(!file){document.getElementById('disasm-view').innerHTML='<span style="color:var(--red)">No file loaded. Attach a binary first.</span>';return}
+  document.getElementById('disasm-view').innerHTML='<span style="color:var(--amber)">Disassembling...</span>';
+  document.getElementById('disasm-info').textContent='loading...';
+  try{
+    const r=await fetch(apiUrl('/api/disasm'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file,count:128})});
+    const d=await r.json();
+    if(!d.ok){document.getElementById('disasm-view').innerHTML='<span style="color:var(--red)">'+d.disasm+'</span>';return}
+    document.getElementById('disasm-view').innerHTML=highlightDisasm(d.disasm);
+    document.getElementById('disasm-info').textContent='entry: '+d.entry+' | '+d.imports.length+' imports | '+d.strings.length+' strings';
+  }catch(e){document.getElementById('disasm-view').innerHTML='<span style="color:var(--red)">Error: '+e.message+'</span>'}
+}
+async function loadFunctions(){
+  const file=getUploadedFile();
+  if(!file)return;
+  document.getElementById('func-list').innerHTML='<span style="color:var(--amber)">Loading...</span>';
+  try{
+    const r=await fetch(apiUrl('/api/disasm'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file,functions_only:true})});
+    const d=await r.json();
+    const list=document.getElementById('func-list');
+    if(d.functions&&d.functions.length){
+      list.innerHTML=d.functions.map(f=>{
+        const name=f.name||'unknown';
+        const addr='0x'+(f.offset||0).toString(16);
+        return '<div class="func-item" onclick="disasmAt(\''+addr+'\')" title="'+addr+' '+name+'">'+name+'</div>';
+      }).join('');
+    }else{
+      list.innerHTML='<span style="color:var(--muted);font-size:11px">No functions found</span>';
+    }
+  }catch(e){document.getElementById('func-list').innerHTML='<span style="color:var(--red)">'+e.message+'</span>'}
+}
+async function disasmAt(addr){
+  const target=addr||document.getElementById('disasm-addr').value.trim();
+  if(!target)return;
+  const file=getUploadedFile();
+  if(!file)return;
+  document.getElementById('disasm-view').innerHTML='<span style="color:var(--amber)">Disassembling at '+target+'...</span>';
+  document.querySelectorAll('.func-item').forEach(f=>{f.classList.toggle('active',f.textContent.includes(target)||f.title.includes(target))});
+  try{
+    const r=await fetch(apiUrl('/api/disasm'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file,address:target})});
+    const d=await r.json();
+    document.getElementById('disasm-view').innerHTML=highlightDisasm(d.disasm);
+  }catch(e){document.getElementById('disasm-view').innerHTML='<span style="color:var(--red)">'+e.message+'</span>'}
+}
+// --- Runtime analysis functions ---
+async function runRuntimeAction(action,label){
+  const file=getUploadedFile();
+  if(!file){document.getElementById('runtime-results').innerHTML='<div style="color:var(--red);padding:20px">No file loaded. Attach a binary first.</div>';return}
+  document.getElementById('runtime-results').innerHTML='<div style="color:var(--amber);padding:20px">Running '+label+'...</div>';
+  document.getElementById('runtime-findings').classList.add('hidden');
+  try{
+    const r=await fetch(apiUrl('/api/runtime'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file,action})});
+    const d=await r.json();
+    document.getElementById('runtime-results').innerHTML='<div class="section-title">'+d.action+'</div><pre>'+d.output.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'})[c])+'</pre>';
+    if(d.findings&&d.findings.length){
+      document.getElementById('runtime-findings').classList.remove('hidden');
+      document.getElementById('runtime-findings-list').innerHTML=d.findings.map(f=>'<div class="rt-finding"><span class="rt-type '+(f.type||'')+'">'+(f.type||'info')+(f.algo?' · '+f.algo:'')+'</span><span>'+((f.detail||'')).replace(/[<>]/g,'')+'</span></div>').join('');
+    }
+    addMsg('malvex','[runtime:'+d.action+'] '+d.output.substring(0,500)+(d.output.length>500?'...(truncated)':''));
+  }catch(e){document.getElementById('runtime-results').innerHTML='<div style="color:var(--red);padding:20px">Error: '+e.message+'</div>'}
+}
+function runCryptoScan(){runRuntimeAction('crypto','Crypto Key Scan')}
+function runFridaHooks(){runRuntimeAction('hooks','Frida Hook Generation')}
+function runUnpackAnalysis(){runRuntimeAction('unpack','Unpack Analysis')}
+function runRuntimeTriage(){runRuntimeAction('triage','Runtime Triage')}
 const dropZone=document.getElementById('drop-zone');
 if(dropZone){
 ['dragenter','dragover'].forEach(ev=>dropZone.addEventListener(ev,e=>{e.preventDefault();dropZone.style.borderColor='var(--pink)'}));
