@@ -495,7 +495,7 @@ async fn api_prompt(State(st): State<Arc<AppState>>, Json(req): Json<PromptReque
         let parts: Vec<&str> = prompt.splitn(3, ' ').collect();
         if parts.len() >= 3 {
             let tool_name = parts[1];
-            let target = parts[2].trim_matches(['\'', '"', '`']);
+            let target = parts[2].trim_matches(['\'', '"', '`', '@']);
             if let Some(runner) = malvex_tools::find_runner(tool_name) {
                 let path = std::path::Path::new(target);
                 if path.is_file() {
@@ -512,7 +512,7 @@ async fn api_prompt(State(st): State<Arc<AppState>>, Json(req): Json<PromptReque
     }
 
     // Doctor check
-    if lower.contains("doctor") || lower.contains("health") || lower.contains("tools") {
+    if lower.contains("doctor") || lower.contains("health") || lower == "/doctor" {
         let tools = malvex_doctor::scan(malvex_core::Platform::current());
         let available = tools.iter().filter(|t| t.present).count();
         let list: Vec<String> = tools.iter().map(|t| format!("{} {}{}", if t.present {"✓"} else {"✗"}, t.name, if t.via_mcp.is_some() {" (MCP)"} else {""})).collect();
